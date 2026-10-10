@@ -5,17 +5,14 @@
 const BlockDef blockDefs[BLOCK_COUNT] = {
     [BLOCK_AIR] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":air",
-        .solid = false,
-        .hardness = 0.0f
+        .solid = false
     },
     [BLOCK_GRASS] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":grass",
-        .solid = true,
-        .hardness = 0.6f
+        .solid = true
     },
     [BLOCK_STONE] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":stone",
-        .solid = true,
-        .hardness = 1.5f
+        .solid = true
     }
 };

@@ -1,6 +1,11 @@
 #include "blocks.h"
+#include "player.h"
+#include "save.h"
+#include "version.h"
+#include "world.h"
 
 #include "raylib.h"
+#include "raymath.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -9,46 +14,40 @@
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
-#define WORLD_WIDTH 256
-#define WORLD_DEPTH 256
-#define WORLD_HEIGHT 256
 #define TERRAIN_LAYERS 3
-#define PLAYER_RADIUS 0.30f
-#define PLAYER_HEIGHT 1.80f
-#define PLAYER_EYE_HEIGHT 1.62f
 #define REACH_DISTANCE 6.0f
-#define INVENTORY_CAPACITY 64
-#define PI 3.14159265358979323846f
+#define HOTBAR_SIZE 2
 #define DEFAULT_RESOLUTION_INDEX 1
 #define DEFAULT_SENSITIVITY_INDEX 2
-#define RESOLUTION_COUNT 3
+#define DEFAULT_FOV 75
+#define DEFAULT_VOLUME 80
+#define FOV_MIN 60
+#define FOV_MAX 110
+#define FOV_STEP 5
+#define VOLUME_STEP 10
+#define RESOLUTION_COUNT 7
 #define SENSITIVITY_COUNT 8
 #define SETTINGS_FILE "veyloria.cfg"
 #define SETTINGS_TEMP_FILE "veyloria.cfg.tmp"
+#define SAVE_FILE "veyloria-world.sav"
+#define SAVE_TEMP_FILE "veyloria-world.sav.tmp"
+#define SAVE_BACKUP_FILE "veyloria-world.sav.bak"
 #define MENU_BACKGROUND_PATH "assets/menubg.png"
 #define MENU_LOGO_PATH "assets/logo.png"
 #define MENU_LOGO_WIDTH 384
 #define MENU_LOGO_HEIGHT 192
-#define SAVE_FILE "veyloria-world.sav"
-#define SAVE_TEMP_FILE "veyloria-world.sav.tmp"
-#define SAVE_VERSION 2u
-#define SAVE_LEGACY_VERSION 1u
-#define SAVE_BUFFER_SIZE 65536
+#define FRUSTUM_FAR 1200.0f
 
-// SUMMARY: Runs the voxel game, main/config menus, and world/settings persistence.
+// SUMMARY: Runs the voxel game, chunked renderer, menus, audio, and settings.
 
-typedef struct World {
-  BlockId blocks[WORLD_WIDTH][WORLD_HEIGHT][WORLD_DEPTH];
-  int highestBlockY[WORLD_WIDTH][WORLD_DEPTH];
-} World;
-
-typedef struct Player {
-  Vector3 feet;
-  float yaw;
-  float pitch;
-  float verticalVelocity;
-  bool grounded;
-} Player;
+typedef struct MeshBuilder {
+  float *vertices;
+  float *normals;
+  float *texcoords;
+  unsigned char *colors;
+  int vertexCount;
+  int capacity;
+} MeshBuilder;
 
 typedef struct RayHit {
   bool hit;
@@ -61,14 +60,14 @@ typedef struct RayHit {
   float distance;
 } RayHit;
 
-typedef struct MeshBuilder {
-  float *vertices;
-  float *normals;
-  float *texcoords;
-  unsigned char *colors;
-  int vertexCount;
-  int capacity;
-} MeshBuilder;
+typedef struct ChunkRender {
+  Model models[BLOCK_COUNT];
+} ChunkRender;
+
+typedef struct Frustum {
+  Vector3 normal[6];
+  float distance[6];
+} Frustum;
 
 typedef struct Resolution {
   int width;
@@ -78,7 +77,18 @@ typedef struct Resolution {
 typedef struct GameSettings {
   int resolutionIndex;
   int sensitivityIndex;
+  int fovDegrees;
+  int volume;
+  bool fullscreen;
+  bool vsync;
 } GameSettings;
+
+typedef struct GameAudio {
+  Sound breakSound;
+  Sound placeSound;
+  Sound stepSound;
+  bool ready;
+} GameAudio;
 
 typedef enum ScreenState {
   SCREEN_MAIN_MENU,
@@ -86,55 +96,50 @@ typedef enum ScreenState {
   SCREEN_PLAYING
 } ScreenState;
 
+typedef enum ConfigField {
+  CFG_RESOLUTION,
+  CFG_FULLSCREEN,
+  CFG_FOV,
+  CFG_SENSITIVITY,
+  CFG_VSYNC,
+  CFG_VOLUME,
+  CFG_FIELD_COUNT
+} ConfigField;
+
 static World world;
-static Model worldModels[BLOCK_COUNT];
-static bool worldModelsLoaded;
+static ChunkRender chunkRenders[CHUNKS_X][CHUNKS_Y][CHUNKS_Z];
 static Texture2D blockTextures[BLOCK_COUNT];
 static bool blockTextureLoaded[BLOCK_COUNT];
+static GameAudio audio;
 static const Resolution resolutions[RESOLUTION_COUNT] = {
-    {640, 480}, {WINDOW_WIDTH, WINDOW_HEIGHT}, {1024, 768}};
+    {640, 480},  {WINDOW_WIDTH, WINDOW_HEIGHT}, {1024, 768}, {1280, 720},
+    {1280, 960}, {1600, 900},                   {1920, 1080}};
 static const float sensitivities[SENSITIVITY_COUNT] = {
     0.0005f, 0.0010f, 0.0015f, 0.0020f,
     0.0025f, 0.0030f, 0.0035f, 0.0040f};
+static const char *configFieldNames[CFG_FIELD_COUNT] = {
+    "Resolution", "Fullscreen", "Field of view", "Mouse sensitivity", "VSync",
+    "Volume"};
 
-static bool InWorld(int x, int y, int z) {
-  return x >= 0 && x < WORLD_WIDTH && y >= 0 && y < WORLD_HEIGHT && z >= 0 &&
-         z < WORLD_DEPTH;
-}
+static bool InWorld(int x, int y, int z) { return WorldInBounds(x, y, z); }
 
 static BlockId GetBlock(int x, int y, int z) {
-  if (!InWorld(x, y, z))
-    return BLOCK_AIR;
-  return world.blocks[x][y][z];
+  return WorldGetBlock(&world, x, y, z);
 }
 
 static void SetBlock(int x, int y, int z, BlockId id) {
-  if (!InWorld(x, y, z))
-    return;
-
-  world.blocks[x][y][z] = id;
-  if (id != BLOCK_AIR && y > world.highestBlockY[x][z]) {
-    world.highestBlockY[x][z] = y;
-  } else if (id == BLOCK_AIR && y == world.highestBlockY[x][z]) {
-    while (world.highestBlockY[x][z] >= 0 &&
-           world.blocks[x][world.highestBlockY[x][z]][z] == BLOCK_AIR) {
-      world.highestBlockY[x][z]--;
-    }
-  }
+  WorldSetBlock(&world, x, y, z, id);
 }
 
 static void InitializeWorld(void) {
-  memset(world.blocks, 0, sizeof(world.blocks));
+  WorldInit(&world);
   for (int x = 0; x < WORLD_WIDTH; x++) {
-    for (int y = 0; y < TERRAIN_LAYERS; y++) {
-      for (int z = 0; z < WORLD_DEPTH; z++) {
-        // The surface is grass; the two layers beneath it are stone.
-        world.blocks[x][y][z] =
-            (y == TERRAIN_LAYERS - 1) ? BLOCK_GRASS : BLOCK_STONE;
-      }
-    }
     for (int z = 0; z < WORLD_DEPTH; z++) {
-      world.highestBlockY[x][z] = TERRAIN_LAYERS - 1;
+      for (int y = 0; y < TERRAIN_LAYERS; y++) {
+        // The surface is grass; the two layers beneath it are stone.
+        SetBlock(x, y, z, (y == TERRAIN_LAYERS - 1) ? BLOCK_GRASS
+                                                   : BLOCK_STONE);
+      }
     }
   }
 }
@@ -148,13 +153,13 @@ static void EnsureMeshCapacity(MeshBuilder *builder, int required) {
     newCapacity *= 2;
 
   builder->vertices =
-      realloc(builder->vertices, (size_t)newCapacity * 3 * sizeof(float));
+      MemRealloc(builder->vertices, (unsigned int)(newCapacity * 3 * sizeof(float)));
   builder->normals =
-      realloc(builder->normals, (size_t)newCapacity * 3 * sizeof(float));
+      MemRealloc(builder->normals, (unsigned int)(newCapacity * 3 * sizeof(float)));
   builder->texcoords =
-      realloc(builder->texcoords, (size_t)newCapacity * 2 * sizeof(float));
-  builder->colors =
-      realloc(builder->colors, (size_t)newCapacity * 4 * sizeof(unsigned char));
+      MemRealloc(builder->texcoords, (unsigned int)(newCapacity * 2 * sizeof(float)));
+  builder->colors = MemRealloc(
+      builder->colors, (unsigned int)(newCapacity * 4 * sizeof(unsigned char)));
   if (!builder->vertices || !builder->normals || !builder->texcoords ||
       !builder->colors) {
     TraceLog(LOG_FATAL, "Failed to allocate world mesh");
@@ -221,42 +226,55 @@ static void AddFace(MeshBuilder *builder, int x, int y, int z, BlockId id,
   }
 }
 
-static void UnloadWorldModels(void) {
-  if (!worldModelsLoaded)
-    return;
+static void UnloadChunkModels(int cx, int cy, int cz) {
   for (int id = 1; id < BLOCK_COUNT; id++) {
-    if (worldModels[id].meshCount > 0)
-      UnloadModel(worldModels[id]);
+    if (chunkRenders[cx][cy][cz].models[id].meshCount > 0)
+      UnloadModel(chunkRenders[cx][cy][cz].models[id]);
   }
-  memset(worldModels, 0, sizeof(worldModels));
-  worldModelsLoaded = false;
+  memset(&chunkRenders[cx][cy][cz], 0, sizeof(chunkRenders[cx][cy][cz]));
 }
 
-static void BuildWorldModels(void) {
+static void UnloadAllChunkModels(void) {
+  for (int cx = 0; cx < CHUNKS_X; cx++) {
+    for (int cy = 0; cy < CHUNKS_Y; cy++) {
+      for (int cz = 0; cz < CHUNKS_Z; cz++)
+        UnloadChunkModels(cx, cy, cz);
+    }
+  }
+}
+
+static void BuildChunkMesh(int cx, int cy, int cz) {
   static const int neighbor[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
   MeshBuilder builders[BLOCK_COUNT] = {0};
+  const Chunk *chunk = WorldChunkAtConst(&world, cx, cy, cz);
 
-  for (int x = 0; x < WORLD_WIDTH; x++) {
-    for (int z = 0; z < WORLD_DEPTH; z++) {
-      for (int y = 0; y <= world.highestBlockY[x][z]; y++) {
-        BlockId id = GetBlock(x, y, z);
-        if (id == BLOCK_AIR)
-          continue;
+  if (chunk != NULL && chunk->maxLocalY >= 0) {
+    int baseX = cx * CHUNK_SIZE;
+    int baseY = cy * CHUNK_SIZE;
+    int baseZ = cz * CHUNK_SIZE;
+    for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+      for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+        for (int ly = 0; ly <= chunk->maxLocalY; ly++) {
+          BlockId id = chunk->blocks[lx][ly][lz];
+          if (id == BLOCK_AIR)
+            continue;
 
-        for (int face = 0; face < 6; face++) {
-          if (!blockDefs[GetBlock(x + neighbor[face][0], y + neighbor[face][1],
-                                  z + neighbor[face][2])]
-                   .solid) {
-            AddFace(&builders[id], x, y, z, id, face,
-                    blockTextureLoaded[id]);
+          for (int face = 0; face < 6; face++) {
+            int nx = baseX + lx + neighbor[face][0];
+            int ny = baseY + ly + neighbor[face][1];
+            int nz = baseZ + lz + neighbor[face][2];
+            if (!blockDefs[GetBlock(nx, ny, nz)].solid) {
+              AddFace(&builders[id], baseX + lx, baseY + ly, baseZ + lz, id,
+                      face, blockTextureLoaded[id]);
+            }
           }
         }
       }
     }
   }
 
-  Model newModels[BLOCK_COUNT] = {0};
+  UnloadChunkModels(cx, cy, cz);
   for (int id = 1; id < BLOCK_COUNT; id++) {
     MeshBuilder *builder = &builders[id];
     if (builder->vertexCount == 0)
@@ -270,265 +288,69 @@ static void BuildWorldModels(void) {
     mesh.texcoords = builder->texcoords;
     mesh.colors = builder->colors;
     UploadMesh(&mesh, false);
-    newModels[id] = LoadModelFromMesh(mesh);
-    if (blockTextureLoaded[id] && newModels[id].materialCount > 0) {
-      SetMaterialTexture(&newModels[id].materials[0], MATERIAL_MAP_DIFFUSE,
-                         blockTextures[id]);
+    chunkRenders[cx][cy][cz].models[id] = LoadModelFromMesh(mesh);
+    if (blockTextureLoaded[id] &&
+        chunkRenders[cx][cy][cz].models[id].materialCount > 0) {
+      SetMaterialTexture(&chunkRenders[cx][cy][cz].models[id].materials[0],
+                         MATERIAL_MAP_DIFFUSE, blockTextures[id]);
     }
   }
-
-  UnloadWorldModels();
-  memcpy(worldModels, newModels, sizeof(worldModels));
-  worldModelsLoaded = true;
+  WorldMarkChunkClean(&world, cx, cy, cz);
 }
 
-static bool WriteU32(FILE *file, uint32_t value) {
-  uint8_t bytes[4] = {(uint8_t)value, (uint8_t)(value >> 8),
-                      (uint8_t)(value >> 16), (uint8_t)(value >> 24)};
-  return fwrite(bytes, 1, sizeof(bytes), file) == sizeof(bytes);
-}
-
-static bool ReadU32(FILE *file, uint32_t *value) {
-  uint8_t bytes[4];
-  if (fread(bytes, 1, sizeof(bytes), file) != sizeof(bytes))
-    return false;
-
-  *value = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
-  return true;
-}
-
-static bool WriteFloat(FILE *file, float value) {
-  uint32_t bits;
-  memcpy(&bits, &value, sizeof(bits));
-  return WriteU32(file, bits);
-}
-
-static bool ReadFloat(FILE *file, float *value) {
-  uint32_t bits;
-  if (!ReadU32(file, &bits))
-    return false;
-  memcpy(value, &bits, sizeof(bits));
-  return true;
-}
-
-static bool SaveGame(const Player *player, const int inventory[2],
-                     int selectedSlot) {
-  static const uint8_t magic[8] = {'V', 'E', 'Y', 'L', 'O', 'R', 'I', 'A'};
-  size_t blockCount = (size_t)WORLD_WIDTH * WORLD_HEIGHT * WORLD_DEPTH;
-  uint8_t *blockData = malloc(blockCount);
-  if (!blockData)
-    return false;
-
-  bool success = true;
-  size_t index = 0;
-  for (int x = 0; success && x < WORLD_WIDTH; x++) {
-    for (int y = 0; success && y < WORLD_HEIGHT; y++) {
-      for (int z = 0; success && z < WORLD_DEPTH; z++) {
-        BlockId id = world.blocks[x][y][z];
-        if (id >= BLOCK_COUNT) {
-          success = false;
-          break;
-        }
-        blockData[index++] = (uint8_t)id;
+static void RebuildDirtyChunkMeshes(void) {
+  for (int cx = 0; cx < CHUNKS_X; cx++) {
+    for (int cy = 0; cy < CHUNKS_Y; cy++) {
+      for (int cz = 0; cz < CHUNKS_Z; cz++) {
+        if (WorldChunkDirty(&world, cx, cy, cz))
+          BuildChunkMesh(cx, cy, cz);
       }
     }
   }
-
-  int compressedSize = 0;
-  unsigned char *compressedData = NULL;
-  if (success)
-    compressedData = CompressData(blockData, (int)blockCount, &compressedSize);
-  free(blockData);
-  if (!compressedData || compressedSize <= 0) {
-    if (compressedData)
-      MemFree(compressedData);
-    return false;
-  }
-
-  FILE *file = fopen(SAVE_TEMP_FILE, "wb");
-  if (!file) {
-    MemFree(compressedData);
-    return false;
-  }
-
-  success = fwrite(magic, 1, sizeof(magic), file) == sizeof(magic) &&
-            WriteU32(file, SAVE_VERSION) && WriteU32(file, WORLD_WIDTH) &&
-            WriteU32(file, WORLD_DEPTH) && WriteU32(file, WORLD_HEIGHT) &&
-            WriteFloat(file, player->feet.x) &&
-            WriteFloat(file, player->feet.y) &&
-            WriteFloat(file, player->feet.z) && WriteFloat(file, player->yaw) &&
-            WriteFloat(file, player->pitch) &&
-            WriteU32(file, (uint32_t)inventory[0]) &&
-            WriteU32(file, (uint32_t)inventory[1]) &&
-            WriteU32(file, (uint32_t)selectedSlot) &&
-            WriteU32(file, (uint32_t)compressedSize) &&
-            fwrite(compressedData, 1, (size_t)compressedSize, file) ==
-                (size_t)compressedSize;
-  MemFree(compressedData);
-  if (fclose(file) != 0)
-    success = false;
-
-  if (!success || rename(SAVE_TEMP_FILE, SAVE_FILE) != 0) {
-    remove(SAVE_TEMP_FILE);
-    return false;
-  }
-  return true;
 }
 
-static bool LoadGame(Player *player, int inventory[2], int *selectedSlot) {
-  static const uint8_t expectedMagic[8] = {'V', 'E', 'Y', 'L', 'O', 'R', 'I', 'A'};
-  FILE *file = fopen(SAVE_FILE, "rb");
-  if (!file)
-    return false;
-
-  uint8_t magic[8];
-  uint32_t version, width, depth, height;
-  uint32_t grassCount, stoneCount, savedSelectedSlot;
-  Player savedPlayer = {0};
-  bool valid = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
-               memcmp(magic, expectedMagic, sizeof(magic)) == 0 &&
-               ReadU32(file, &version) && ReadU32(file, &width) &&
-               ReadU32(file, &depth) && ReadU32(file, &height) &&
-               ReadFloat(file, &savedPlayer.feet.x) &&
-               ReadFloat(file, &savedPlayer.feet.y) &&
-               ReadFloat(file, &savedPlayer.feet.z) &&
-               ReadFloat(file, &savedPlayer.yaw) &&
-               ReadFloat(file, &savedPlayer.pitch) &&
-               ReadU32(file, &grassCount) && ReadU32(file, &stoneCount) &&
-               ReadU32(file, &savedSelectedSlot);
-
-  valid = valid &&
-          (version == SAVE_LEGACY_VERSION || version == SAVE_VERSION) &&
-          width == WORLD_WIDTH &&
-          depth == WORLD_DEPTH && height == WORLD_HEIGHT &&
-          isfinite(savedPlayer.feet.x) && isfinite(savedPlayer.feet.y) &&
-          isfinite(savedPlayer.feet.z) && isfinite(savedPlayer.yaw) &&
-          isfinite(savedPlayer.pitch) &&
-          savedPlayer.feet.x >= PLAYER_RADIUS &&
-          savedPlayer.feet.x <= WORLD_WIDTH - PLAYER_RADIUS &&
-          savedPlayer.feet.y >= 0.0f &&
-          savedPlayer.feet.y <= WORLD_HEIGHT - PLAYER_HEIGHT &&
-          savedPlayer.feet.z >= PLAYER_RADIUS &&
-          savedPlayer.feet.z <= WORLD_DEPTH - PLAYER_RADIUS &&
-          savedPlayer.pitch >= -1.5f && savedPlayer.pitch <= 1.5f &&
-          grassCount <= INVENTORY_CAPACITY && stoneCount <= INVENTORY_CAPACITY &&
-          savedSelectedSlot < 2;
-
-  size_t blockCount = (size_t)WORLD_WIDTH * WORLD_HEIGHT * WORLD_DEPTH;
-  uint8_t *blockData = NULL;
-  if (valid) {
-    blockData = malloc(blockCount);
-    valid = blockData != NULL;
-  }
-
-  if (valid && version == SAVE_LEGACY_VERSION) {
-    size_t loadedCount = 0;
-    while (valid && loadedCount < blockCount) {
-      size_t remaining = blockCount - loadedCount;
-      size_t amount = remaining < SAVE_BUFFER_SIZE ? remaining : SAVE_BUFFER_SIZE;
-      if (fread(blockData + loadedCount, 1, amount, file) != amount) {
-        valid = false;
-        break;
-      }
-      loadedCount += amount;
-    }
-  } else if (valid) {
-    uint32_t compressedSize = 0;
-    valid = ReadU32(file, &compressedSize) && compressedSize > 0 &&
-            (uint64_t)compressedSize <= (uint64_t)blockCount * 2;
-    unsigned char *compressedData = NULL;
-    if (valid) {
-      compressedData = malloc(compressedSize);
-      valid = compressedData != NULL;
-    }
-    if (valid)
-      valid = fread(compressedData, 1, compressedSize, file) == compressedSize;
-    if (valid) {
-      int decompressedSize = 0;
-      unsigned char *decompressedData =
-          DecompressData(compressedData, (int)compressedSize, &decompressedSize);
-      valid = decompressedData && decompressedSize == (int)blockCount;
-      if (valid)
-        memcpy(blockData, decompressedData, blockCount);
-      if (decompressedData)
-        MemFree(decompressedData);
-    }
-    free(compressedData);
-  }
-
-  if (valid && (fgetc(file) != EOF || ferror(file)))
-    valid = false;
-  if (fclose(file) != 0)
-    valid = false;
-
-  if (valid) {
-    for (size_t i = 0; i < blockCount; i++) {
-      if (blockData[i] >= BLOCK_COUNT) {
-        valid = false;
-        break;
-      }
-    }
-  }
-
-  if (!valid) {
-    free(blockData);
-    return false;
-  }
-
-  size_t index = 0;
-  for (int x = 0; x < WORLD_WIDTH; x++) {
-    for (int y = 0; y < WORLD_HEIGHT; y++) {
-      for (int z = 0; z < WORLD_DEPTH; z++)
-        world.blocks[x][y][z] = (BlockId)blockData[index++];
-    }
-  }
-  free(blockData);
-  for (int x = 0; x < WORLD_WIDTH; x++) {
-    for (int z = 0; z < WORLD_DEPTH; z++) {
-      int highestY = WORLD_HEIGHT - 1;
-      while (highestY >= 0 && world.blocks[x][highestY][z] == BLOCK_AIR)
-        highestY--;
-      world.highestBlockY[x][z] = highestY;
-    }
-  }
-
-  savedPlayer.verticalVelocity = 0.0f;
-  savedPlayer.grounded = false;
-  *player = savedPlayer;
-  inventory[0] = (int)grassCount;
-  inventory[1] = (int)stoneCount;
-  *selectedSlot = (int)savedSelectedSlot;
-  return true;
+static void ReloadWorldMeshes(void) {
+  UnloadAllChunkModels();
+  WorldMarkAllChunksDirty(&world);
+  RebuildDirtyChunkMeshes();
 }
 
-static void LoadSettings(GameSettings *settings) {
-  FILE *file = fopen(SETTINGS_FILE, "r");
-  if (!file)
-    return;
+static Frustum MakeFrustum(Vector3 eye, Vector3 forward, Vector3 cameraUp,
+                           float fovDegrees, float aspect) {
+  Vector3 f = Vector3Normalize(forward);
+  Vector3 r = Vector3Normalize(Vector3CrossProduct(f, cameraUp));
+  Vector3 u = Vector3CrossProduct(r, f);
+  float tanV = tanf(fovDegrees * DEG2RAD * 0.5f);
+  float tanH = tanV * aspect;
 
-  int resolutionIndex, sensitivityIndex;
-  if (fscanf(file, "%d %d", &resolutionIndex, &sensitivityIndex) == 2 &&
-      resolutionIndex >= 0 && resolutionIndex < RESOLUTION_COUNT &&
-      sensitivityIndex >= 0 && sensitivityIndex < SENSITIVITY_COUNT) {
-    settings->resolutionIndex = resolutionIndex;
-    settings->sensitivityIndex = sensitivityIndex;
-  }
-  fclose(file);
+  Vector3 leftDir = Vector3Subtract(f, Vector3Scale(r, tanH));
+  Vector3 rightDir = Vector3Add(f, Vector3Scale(r, tanH));
+  Vector3 upDir = Vector3Add(f, Vector3Scale(u, tanV));
+  Vector3 downDir = Vector3Subtract(f, Vector3Scale(u, tanV));
+
+  Frustum frustum;
+  frustum.normal[0] = Vector3Normalize(Vector3CrossProduct(leftDir, u));
+  frustum.normal[1] = Vector3Normalize(Vector3CrossProduct(u, rightDir));
+  frustum.normal[2] = Vector3Normalize(Vector3CrossProduct(upDir, r));
+  frustum.normal[3] = Vector3Normalize(Vector3CrossProduct(r, downDir));
+  frustum.normal[4] = f;
+  frustum.normal[5] = Vector3Scale(f, -1.0f);
+  for (int i = 0; i < 5; i++)
+    frustum.distance[i] = -Vector3DotProduct(frustum.normal[i], eye);
+  frustum.distance[5] = Vector3DotProduct(f, eye) + FRUSTUM_FAR;
+  return frustum;
 }
 
-static bool SaveSettings(const GameSettings *settings) {
-  FILE *file = fopen(SETTINGS_TEMP_FILE, "w");
-  if (!file)
-    return false;
-
-  bool success = fprintf(file, "%d %d\n", settings->resolutionIndex,
-                         settings->sensitivityIndex) > 0;
-  if (fclose(file) != 0)
-    success = false;
-  if (!success || rename(SETTINGS_TEMP_FILE, SETTINGS_FILE) != 0) {
-    remove(SETTINGS_TEMP_FILE);
-    return false;
+static bool FrustumVisible(const Frustum *frustum, Vector3 min, Vector3 max) {
+  for (int i = 0; i < 6; i++) {
+    Vector3 corner = {
+        frustum->normal[i].x >= 0.0f ? max.x : min.x,
+        frustum->normal[i].y >= 0.0f ? max.y : min.y,
+        frustum->normal[i].z >= 0.0f ? max.z : min.z,
+    };
+    if (Vector3DotProduct(frustum->normal[i], corner) + frustum->distance[i] <
+        0.0f)
+      return false;
   }
   return true;
 }
@@ -614,10 +436,10 @@ static void UpdatePlayer(Player *player, float deltaTime, bool applyMouseLook,
     player->yaw += mouse.x * mouseSensitivity;
     player->pitch -= mouse.y * mouseSensitivity;
   }
-  if (player->pitch > 1.50f)
-    player->pitch = 1.50f;
-  if (player->pitch < -1.50f)
-    player->pitch = -1.50f;
+  if (player->pitch > MAX_PITCH)
+    player->pitch = MAX_PITCH;
+  if (player->pitch < -MAX_PITCH)
+    player->pitch = -MAX_PITCH;
 
   float forwardInput = (float)IsKeyDown(KEY_W) - (float)IsKeyDown(KEY_S);
   float sideInput = (float)IsKeyDown(KEY_D) - (float)IsKeyDown(KEY_A);
@@ -731,7 +553,35 @@ static bool PlacementOverlapsPlayer(const Player *player, int x, int y, int z) {
          playerMaxY > y && playerMinZ < z + 1.0f && playerMaxZ > z;
 }
 
+static const char *BlockShortName(BlockId id) {
+  const char *name = blockDefs[id].name;
+  const char *separator = strrchr(name, ':');
+  return separator ? separator + 1 : name;
+}
+
+static void GiveBlock(ItemStack slots[], int slotCount, BlockId id) {
+  if (id == BLOCK_AIR)
+    return;
+
+  for (int i = 0; i < slotCount; i++) {
+    if (slots[i].id == id && slots[i].count < INVENTORY_CAPACITY) {
+      slots[i].count++;
+      return;
+    }
+  }
+  for (int i = 0; i < slotCount; i++) {
+    if (slots[i].id == BLOCK_AIR) {
+      slots[i].id = id;
+      slots[i].count = 1;
+      return;
+    }
+  }
+}
+
 static void DrawBlockIcon(Rectangle slot, BlockId id) {
+  if (id == BLOCK_AIR)
+    return;
+
   Color color = (id == BLOCK_GRASS) ? (Color){101, 176, 72, 255}
                                     : (Color){132, 136, 143, 255};
   int size = 24;
@@ -743,48 +593,52 @@ static void DrawBlockIcon(Rectangle slot, BlockId id) {
                                     : (Color){94, 98, 104, 255});
 }
 
-static void DrawHotbar(int selectedSlot, const int inventory[2]) {
+static void DrawHotbar(int selectedSlot, const ItemStack slots[]) {
   const int slotSize = 58;
   const int gap = 6;
-  int totalWidth = slotSize * 2 + gap;
+  int totalWidth = slotSize * HOTBAR_SIZE + gap * (HOTBAR_SIZE - 1);
   int startX = (GetScreenWidth() - totalWidth) / 2;
   int y = GetScreenHeight() - slotSize - 22;
-  const BlockId slots[2] = {BLOCK_GRASS, BLOCK_STONE};
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < HOTBAR_SIZE; i++) {
     Rectangle slot = {(float)(startX + i * (slotSize + gap)), (float)y,
                       (float)slotSize, (float)slotSize};
     DrawRectangleRec(slot, (Color){21, 22, 24, 220});
     DrawRectangleLinesEx(slot, (i == selectedSlot) ? 3.0f : 1.0f,
                          (i == selectedSlot) ? RAYWHITE
                                              : (Color){120, 120, 120, 220});
-    DrawBlockIcon(slot, slots[i]);
+    DrawBlockIcon(slot, slots[i].id);
 
     DrawRectangle((int)slot.x + 7, y + slotSize - 8, slotSize - 14, 3,
                   (Color){45, 45, 45, 255});
-    int barWidth = (slotSize - 14) * inventory[i] / INVENTORY_CAPACITY;
+    int barWidth = (slotSize - 14) * slots[i].count / INVENTORY_CAPACITY;
     if (barWidth > 0)
       DrawRectangle((int)slot.x + 7, y + slotSize - 8, barWidth, 3, RAYWHITE);
   }
 }
 
-static void DrawDebug(const Player *player, BlockId heldBlock,
-                      const int inventory[2], RayHit hit) {
-  DrawRectangle(12, 12, 330, 154, (Color){0, 0, 0, 170});
+static void DrawDebug(const Player *player, const ItemStack slots[],
+                      int selectedSlot, RayHit hit, int chunksDrawn,
+                      int chunksTotal) {
+  DrawRectangle(12, 12, 360, 196, (Color){0, 0, 0, 170});
   Vector3 eye = PlayerEye(player);
   DrawText("VEYLORIA DEBUG", 22, 20, 18, RAYWHITE);
 
   char line[128];
-  snprintf(line, sizeof(line), "Block in hand: %s", blockDefs[heldBlock].name);
+  snprintf(line, sizeof(line), "Version: %s", VEYLORIA_VERSION);
   DrawText(line, 22, 47, 16, RAYWHITE);
+  snprintf(line, sizeof(line), "Block in hand: %s",
+           blockDefs[slots[selectedSlot].id].name);
+  DrawText(line, 22, 68, 16, RAYWHITE);
   snprintf(line, sizeof(line), "Position: %.2f, %.2f, %.2f", player->feet.x,
            player->feet.y, player->feet.z);
-  DrawText(line, 22, 68, 16, RAYWHITE);
-  snprintf(line, sizeof(line), "Eye: %.2f, %.2f, %.2f", eye.x, eye.y, eye.z);
   DrawText(line, 22, 89, 16, RAYWHITE);
-  snprintf(line, sizeof(line), "Inventory: grass %d | stone %d", inventory[0],
-           inventory[1]);
+  snprintf(line, sizeof(line), "Eye: %.2f, %.2f, %.2f", eye.x, eye.y, eye.z);
   DrawText(line, 22, 110, 16, RAYWHITE);
+  snprintf(line, sizeof(line), "Hotbar: %s %d | %s %d",
+           BlockShortName(slots[0].id), slots[0].count,
+           BlockShortName(slots[1].id), slots[1].count);
+  DrawText(line, 22, 131, 16, RAYWHITE);
   if (hit.hit) {
     snprintf(line, sizeof(line), "Target: %s at %d, %d, %d (%.1fm)",
              blockDefs[GetBlock(hit.x, hit.y, hit.z)].name, hit.x, hit.y, hit.z,
@@ -792,7 +646,10 @@ static void DrawDebug(const Player *player, BlockId heldBlock,
   } else {
     snprintf(line, sizeof(line), "Target: none");
   }
-  DrawText(line, 22, 131, 16, RAYWHITE);
+  DrawText(line, 22, 152, 16, RAYWHITE);
+  snprintf(line, sizeof(line), "Chunks: %d drawn / %d loaded", chunksDrawn,
+           chunksTotal);
+  DrawText(line, 22, 173, 16, RAYWHITE);
 }
 
 static Rectangle MainMenuButtonBounds(int index) {
@@ -807,13 +664,13 @@ static Rectangle MainMenuButtonBounds(int index) {
 }
 
 static float ConfigRowY(int row) {
-  return GetScreenHeight() * 0.5f - 85.0f + row * 80.0f;
+  return GetScreenHeight() * 0.28f + row * (GetScreenHeight() * 0.09f);
 }
 
 static Rectangle ConfigArrowBounds(int row, bool rightArrow) {
   float centerX = GetScreenWidth() * 0.5f;
-  return (Rectangle){centerX + (rightArrow ? 165.0f : 35.0f), ConfigRowY(row),
-                     42.0f, 44.0f};
+  return (Rectangle){centerX + (rightArrow ? 180.0f : 20.0f), ConfigRowY(row),
+                     38.0f, 36.0f};
 }
 
 static Rectangle ConfigBackBounds(void) {
@@ -906,6 +763,73 @@ static void DrawMainMenu(Texture2D background, bool hasBackground, Texture2D log
   DrawMenuButton(MainMenuButtonBounds(2), "EXIT");
 }
 
+static void ConfigFieldText(const GameSettings *settings, ConfigField field,
+                            char *buffer, size_t size) {
+  switch (field) {
+  case CFG_RESOLUTION: {
+    const Resolution resolution = resolutions[settings->resolutionIndex];
+    snprintf(buffer, size, "%d x %d", resolution.width, resolution.height);
+    break;
+  }
+  case CFG_FULLSCREEN:
+    snprintf(buffer, size, "%s", settings->fullscreen ? "On" : "Off");
+    break;
+  case CFG_FOV:
+    snprintf(buffer, size, "%d", settings->fovDegrees);
+    break;
+  case CFG_SENSITIVITY:
+    snprintf(buffer, size, "%.4f", sensitivities[settings->sensitivityIndex]);
+    break;
+  case CFG_VSYNC:
+    snprintf(buffer, size, "%s", settings->vsync ? "On" : "Off");
+    break;
+  case CFG_VOLUME:
+    snprintf(buffer, size, "%d%%", settings->volume);
+    break;
+  default:
+    snprintf(buffer, size, "?");
+    break;
+  }
+}
+
+static void AdjustConfig(GameSettings *settings, ConfigField field, int step) {
+  switch (field) {
+  case CFG_RESOLUTION:
+    settings->resolutionIndex =
+        (settings->resolutionIndex + RESOLUTION_COUNT + step) % RESOLUTION_COUNT;
+    break;
+  case CFG_FULLSCREEN:
+    settings->fullscreen = !settings->fullscreen;
+    break;
+  case CFG_FOV:
+    settings->fovDegrees += step * FOV_STEP;
+    if (settings->fovDegrees < FOV_MIN)
+      settings->fovDegrees = FOV_MIN;
+    if (settings->fovDegrees > FOV_MAX)
+      settings->fovDegrees = FOV_MAX;
+    break;
+  case CFG_SENSITIVITY:
+    settings->sensitivityIndex += step;
+    if (settings->sensitivityIndex < 0)
+      settings->sensitivityIndex = 0;
+    if (settings->sensitivityIndex > SENSITIVITY_COUNT - 1)
+      settings->sensitivityIndex = SENSITIVITY_COUNT - 1;
+    break;
+  case CFG_VSYNC:
+    settings->vsync = !settings->vsync;
+    break;
+  case CFG_VOLUME:
+    settings->volume += step * VOLUME_STEP;
+    if (settings->volume < 0)
+      settings->volume = 0;
+    if (settings->volume > 100)
+      settings->volume = 100;
+    break;
+  default:
+    break;
+  }
+}
+
 static void DrawConfigMenu(Texture2D background, bool hasBackground,
                            Texture2D logo, bool hasLogo,
                            const GameSettings *settings) {
@@ -918,24 +842,88 @@ static void DrawConfigMenu(Texture2D background, bool hasBackground,
            RAYWHITE);
 
   int centerX = GetScreenWidth() / 2;
-  float rowY = ConfigRowY(0);
-  DrawText("Resolution", centerX - 225, (int)rowY + 12, 20, RAYWHITE);
-  DrawMenuButton(ConfigArrowBounds(0, false), "<");
-  DrawMenuButton(ConfigArrowBounds(0, true), ">");
-  const Resolution resolution = resolutions[settings->resolutionIndex];
-  const char *resolutionText = TextFormat("%d x %d", resolution.width,
-                                          resolution.height);
-  DrawText(resolutionText, centerX + 82, (int)rowY + 13, 18, RAYWHITE);
-
-  rowY = ConfigRowY(1);
-  DrawText("Mouse sensitivity", centerX - 225, (int)rowY + 12, 20, RAYWHITE);
-  DrawMenuButton(ConfigArrowBounds(1, false), "<");
-  DrawMenuButton(ConfigArrowBounds(1, true), ">");
-  const char *sensitivityText =
-      TextFormat("%.4f", sensitivities[settings->sensitivityIndex]);
-  DrawText(sensitivityText, centerX + 82, (int)rowY + 13, 18, RAYWHITE);
+  char value[32];
+  for (int row = 0; row < CFG_FIELD_COUNT; row++) {
+    float rowY = ConfigRowY(row);
+    DrawText(configFieldNames[row], centerX - 225, (int)rowY + 8, 20, RAYWHITE);
+    DrawMenuButton(ConfigArrowBounds(row, false), "<");
+    DrawMenuButton(ConfigArrowBounds(row, true), ">");
+    ConfigFieldText(settings, (ConfigField)row, value, sizeof(value));
+    DrawText(value, centerX + 66, (int)rowY + 10, 18, RAYWHITE);
+  }
 
   DrawMenuButton(ConfigBackBounds(), "BACK");
+}
+
+static void ApplySettings(GameSettings *settings);
+
+static void LoadSettings(GameSettings *settings) {
+  FILE *file = fopen(SETTINGS_FILE, "r");
+  if (!file)
+    return;
+
+  char line[64];
+  while (fgets(line, sizeof(line), file)) {
+    char key[32];
+    int value;
+    if (sscanf(line, "%31[^=]=%d", key, &value) != 2)
+      continue;
+
+    if (strcmp(key, "resolution") == 0 && value >= 0 &&
+        value < RESOLUTION_COUNT)
+      settings->resolutionIndex = value;
+    else if (strcmp(key, "sensitivity") == 0 && value >= 0 &&
+             value < SENSITIVITY_COUNT)
+      settings->sensitivityIndex = value;
+    else if (strcmp(key, "fov") == 0 && value >= FOV_MIN && value <= FOV_MAX)
+      settings->fovDegrees = value;
+    else if (strcmp(key, "volume") == 0 && value >= 0 && value <= 100)
+      settings->volume = value;
+    else if (strcmp(key, "fullscreen") == 0)
+      settings->fullscreen = value != 0;
+    else if (strcmp(key, "vsync") == 0)
+      settings->vsync = value != 0;
+  }
+  fclose(file);
+}
+
+static bool SaveSettings(const GameSettings *settings) {
+  FILE *file = fopen(SETTINGS_TEMP_FILE, "w");
+  if (!file)
+    return false;
+
+  bool success =
+      fprintf(file, "resolution=%d\nsensitivity=%d\nfov=%d\nfullscreen=%d\n"
+                    "vsync=%d\nvolume=%d\n",
+              settings->resolutionIndex, settings->sensitivityIndex,
+              settings->fovDegrees, settings->fullscreen ? 1 : 0,
+              settings->vsync ? 1 : 0, settings->volume) > 0;
+  if (fclose(file) != 0)
+    success = false;
+  if (!success || rename(SETTINGS_TEMP_FILE, SETTINGS_FILE) != 0) {
+    remove(SETTINGS_TEMP_FILE);
+    return false;
+  }
+  return true;
+}
+
+static void ApplySettings(GameSettings *settings) {
+  if (settings->fullscreen != IsWindowFullscreen())
+    ToggleFullscreen();
+  if (!settings->fullscreen) {
+    Resolution resolution = resolutions[settings->resolutionIndex];
+    SetWindowSize(resolution.width, resolution.height);
+  }
+
+  if (settings->vsync)
+    SetWindowState(FLAG_VSYNC_HINT);
+  else
+    ClearWindowState(FLAG_VSYNC_HINT);
+  SetTargetFPS(settings->vsync ? 0 : 60);
+  SetMasterVolume((float)settings->volume / 100.0f);
+
+  if (!SaveSettings(settings))
+    TraceLog(LOG_WARNING, "Could not save %s.", SETTINGS_FILE);
 }
 
 static bool TryLoadAssetTexture(const char *path, Texture2D *texture) {
@@ -969,31 +957,107 @@ static bool LoadAssetTexture(const char *relativePath, Texture2D *texture) {
 
 static void LoadBlockTextures(void) {
   for (int id = 1; id < BLOCK_COUNT; id++) {
-    const char *name = blockDefs[id].name;
-    const char *separator = strrchr(name, ':');
-    const char *fileName = separator ? separator + 1 : name;
     char texturePath[256];
-    snprintf(texturePath, sizeof(texturePath), "assets/%s.png", fileName);
+    snprintf(texturePath, sizeof(texturePath), "assets/%s.png",
+             BlockShortName((BlockId)id));
     blockTextureLoaded[id] =
         LoadAssetTexture(texturePath, &blockTextures[id]);
-    if (!blockTextureLoaded[id])
+    if (blockTextureLoaded[id]) {
+      // Block textures are pixel art; keep them crisp when magnified.
+      SetTextureFilter(blockTextures[id], TEXTURE_FILTER_POINT);
+    } else {
       TraceLog(LOG_INFO, "No texture at %s; using the default block color.",
                texturePath);
+    }
   }
 }
 
+static Wave MakeSoundWave(float seconds, float frequency, float noiseAmount,
+                          float decay, unsigned int *seed) {
+  unsigned int sampleRate = 22050;
+  unsigned int frameCount = (unsigned int)(seconds * (float)sampleRate);
+  if (frameCount < 1)
+    frameCount = 1;
+
+  short *samples = (short *)MemAlloc(frameCount * sizeof(short));
+  for (unsigned int i = 0; i < frameCount; i++) {
+    float t = (float)i / (float)sampleRate;
+    float envelope = expf(-decay * t);
+    *seed = (*seed) * 1103515245u + 12345u;
+    float noise = (float)((*seed >> 16) & 0x7fff) / 16384.0f - 1.0f;
+    float tone = sinf(2.0f * PI * frequency * t);
+    float sample = tone * (1.0f - noiseAmount) + noise * noiseAmount;
+    samples[i] = (short)(sample * envelope * 22000.0f);
+  }
+
+  Wave wave = {0};
+  wave.frameCount = frameCount;
+  wave.sampleRate = sampleRate;
+  wave.sampleSize = 16;
+  wave.channels = 1;
+  wave.data = samples;
+  return wave;
+}
+
+static Sound MakeSound(float seconds, float frequency, float noiseAmount,
+                       float decay, unsigned int *seed, float volume) {
+  Wave wave = MakeSoundWave(seconds, frequency, noiseAmount, decay, seed);
+  Sound sound = LoadSoundFromWave(wave);
+  UnloadWave(wave);
+  SetSoundVolume(sound, volume);
+  return sound;
+}
+
+static void InitGameAudio(GameAudio *gameAudio) {
+  memset(gameAudio, 0, sizeof(*gameAudio));
+  InitAudioDevice();
+  if (!IsAudioDeviceReady()) {
+    TraceLog(LOG_WARNING, "Audio device unavailable; sound is disabled.");
+    return;
+  }
+
+  unsigned int seed = 0x9e3779b9u;
+  gameAudio->breakSound = MakeSound(0.16f, 160.0f, 0.85f, 16.0f, &seed, 0.9f);
+  gameAudio->placeSound = MakeSound(0.10f, 120.0f, 0.30f, 28.0f, &seed, 0.9f);
+  gameAudio->stepSound = MakeSound(0.07f, 90.0f, 0.90f, 40.0f, &seed, 0.5f);
+  gameAudio->ready = true;
+}
+
+static void UnloadGameAudio(GameAudio *gameAudio) {
+  if (gameAudio->ready) {
+    UnloadSound(gameAudio->breakSound);
+    UnloadSound(gameAudio->placeSound);
+    UnloadSound(gameAudio->stepSound);
+    gameAudio->ready = false;
+  }
+  if (IsAudioDeviceReady())
+    CloseAudioDevice();
+}
+
+static void PlayGameSound(const GameAudio *gameAudio, Sound sound) {
+  if (gameAudio->ready && IsSoundValid(sound))
+    PlaySound(sound);
+}
+
 int main(void) {
-  GameSettings settings = {DEFAULT_RESOLUTION_INDEX,
-                           DEFAULT_SENSITIVITY_INDEX};
+  GameSettings settings = {DEFAULT_RESOLUTION_INDEX, DEFAULT_SENSITIVITY_INDEX,
+                           DEFAULT_FOV, DEFAULT_VOLUME, false, true};
   LoadSettings(&settings);
   Resolution initialResolution = resolutions[settings.resolutionIndex];
 
-  SetConfigFlags(FLAG_MSAA_4X_HINT);
+  unsigned int windowFlags = FLAG_MSAA_4X_HINT;
+  if (settings.vsync)
+    windowFlags |= FLAG_VSYNC_HINT;
+  if (settings.fullscreen)
+    windowFlags |= FLAG_FULLSCREEN_MODE;
+  SetConfigFlags(windowFlags);
   InitWindow(initialResolution.width, initialResolution.height,
-             "Veyloria proto-26.10.09-03");
+             "Veyloria " VEYLORIA_VERSION);
   SetExitKey(KEY_NULL);
-  SetTargetFPS(60);
+  SetTargetFPS(settings.vsync ? 0 : 60);
+  SetMasterVolume((float)settings.volume / 100.0f);
   EnableCursor();
+  InitGameAudio(&audio);
 
   Texture2D menuBackground = {0};
   Texture2D menuLogo = {0};
@@ -1010,26 +1074,33 @@ int main(void) {
       .pitch = 0.0f,
       .verticalVelocity = 0.0f,
       .grounded = false};
-  int inventory[2] = {32, 32};
+  ItemStack hotbar[HOTBAR_SIZE] = {{BLOCK_GRASS, 32}, {BLOCK_STONE, 32}};
   int selectedSlot = 0;
   bool debugMode = false;
   bool mouseCaptured = false;
-  bool autoSaveOnExit = true;
   bool exitRequested = false;
+  float stepTimer = 0.0f;
   ScreenState screen = SCREEN_MAIN_MENU;
-  const BlockId hotbarBlocks[2] = {BLOCK_GRASS, BLOCK_STONE};
 
-  if (FileExists(SAVE_FILE) && !LoadGame(&player, inventory, &selectedSlot)) {
-    TraceLog(LOG_WARNING, "Could not load %s; starting with a fresh world.",
+  if (FileExists(SAVE_FILE) &&
+      !LoadGame(SAVE_FILE, &world, &player, hotbar, HOTBAR_SIZE, &selectedSlot)) {
+    TraceLog(LOG_WARNING,
+             "Could not load %s; starting a fresh world and backing it up.",
              SAVE_FILE);
-    autoSaveOnExit = false;
+    if (rename(SAVE_FILE, SAVE_BACKUP_FILE) == 0)
+      TraceLog(LOG_INFO, "Previous save moved to %s.", SAVE_BACKUP_FILE);
   }
-  BuildWorldModels();
+  ReloadWorldMeshes();
 
   while (!WindowShouldClose() && !exitRequested) {
     float deltaTime = GetFrameTime();
     if (deltaTime > 0.05f)
       deltaTime = 0.05f;
+
+    if (IsKeyPressed(KEY_F11)) {
+      settings.fullscreen = !settings.fullscreen;
+      ApplySettings(&settings);
+    }
 
     bool justEnteredPlay = false;
     if (screen == SCREEN_MAIN_MENU) {
@@ -1048,33 +1119,17 @@ int main(void) {
         screen = SCREEN_MAIN_MENU;
       } else {
         bool settingsChanged = false;
-        if (MenuButtonClicked(ConfigArrowBounds(0, false))) {
-          settings.resolutionIndex =
-              (settings.resolutionIndex + RESOLUTION_COUNT - 1) %
-              RESOLUTION_COUNT;
-          settingsChanged = true;
-        } else if (MenuButtonClicked(ConfigArrowBounds(0, true))) {
-          settings.resolutionIndex =
-              (settings.resolutionIndex + 1) % RESOLUTION_COUNT;
-          settingsChanged = true;
+        for (int row = 0; row < CFG_FIELD_COUNT; row++) {
+          if (MenuButtonClicked(ConfigArrowBounds(row, false))) {
+            AdjustConfig(&settings, (ConfigField)row, -1);
+            settingsChanged = true;
+          } else if (MenuButtonClicked(ConfigArrowBounds(row, true))) {
+            AdjustConfig(&settings, (ConfigField)row, 1);
+            settingsChanged = true;
+          }
         }
-
-        if (MenuButtonClicked(ConfigArrowBounds(1, false))) {
-          if (settings.sensitivityIndex > 0)
-            settings.sensitivityIndex--;
-          settingsChanged = true;
-        } else if (MenuButtonClicked(ConfigArrowBounds(1, true))) {
-          if (settings.sensitivityIndex < SENSITIVITY_COUNT - 1)
-            settings.sensitivityIndex++;
-          settingsChanged = true;
-        }
-
-        if (settingsChanged) {
-          Resolution resolution = resolutions[settings.resolutionIndex];
-          SetWindowSize(resolution.width, resolution.height);
-          if (!SaveSettings(&settings))
-            TraceLog(LOG_WARNING, "Could not save %s.", SETTINGS_FILE);
-        }
+        if (settingsChanged)
+          ApplySettings(&settings);
       }
     }
 
@@ -1099,17 +1154,17 @@ int main(void) {
         if (IsKeyPressed(KEY_F1))
           debugMode = !debugMode;
         if (IsKeyPressed(KEY_F5)) {
-          if (SaveGame(&player, inventory, selectedSlot)) {
-            autoSaveOnExit = true;
+          if (SaveGame(SAVE_FILE, SAVE_TEMP_FILE, &world, &player, hotbar,
+                       HOTBAR_SIZE, selectedSlot)) {
             TraceLog(LOG_INFO, "World saved to %s.", SAVE_FILE);
           } else {
             TraceLog(LOG_WARNING, "Could not save world to %s.", SAVE_FILE);
           }
         }
         if (IsKeyPressed(KEY_F9)) {
-          if (LoadGame(&player, inventory, &selectedSlot)) {
-            BuildWorldModels();
-            autoSaveOnExit = true;
+          if (LoadGame(SAVE_FILE, &world, &player, hotbar, HOTBAR_SIZE,
+                       &selectedSlot)) {
+            ReloadWorldMeshes();
             TraceLog(LOG_INFO, "World loaded from %s.", SAVE_FILE);
           } else {
             TraceLog(LOG_WARNING, "Could not load world from %s.", SAVE_FILE);
@@ -1120,33 +1175,47 @@ int main(void) {
                      windowFocused && !justRegainedFocus,
                      sensitivities[settings.sensitivityIndex]);
 
+        bool moving = player.grounded &&
+                      (IsKeyDown(KEY_W) || IsKeyDown(KEY_S) ||
+                       IsKeyDown(KEY_A) || IsKeyDown(KEY_D));
+        if (moving) {
+          stepTimer -= deltaTime;
+          if (stepTimer <= 0.0f) {
+            PlayGameSound(&audio, audio.stepSound);
+            stepTimer = IsKeyDown(KEY_LEFT_SHIFT) ? 0.32f : 0.45f;
+          }
+        } else {
+          stepTimer = 0.15f;
+        }
+
         Vector3 eye = PlayerEye(&player);
         RayHit target = CastBlockRay(eye, LookDirection(&player));
         bool changedWorld = false;
         if (!justEnteredPlay && target.hit &&
             IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-          BlockId broken = GetBlock(target.x, target.y, target.z);
-          int slot = (broken == BLOCK_GRASS) ? 0
-                                             : (broken == BLOCK_STONE) ? 1 : -1;
-          if (slot >= 0 && inventory[slot] < INVENTORY_CAPACITY)
-            inventory[slot]++;
+          GiveBlock(hotbar, HOTBAR_SIZE, GetBlock(target.x, target.y, target.z));
           SetBlock(target.x, target.y, target.z, BLOCK_AIR);
           changedWorld = true;
+          PlayGameSound(&audio, audio.breakSound);
         } else if (!justEnteredPlay && target.hit &&
                    IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-          BlockId placing = hotbarBlocks[selectedSlot];
-          if (inventory[selectedSlot] > 0 &&
+          ItemStack *stack = &hotbar[selectedSlot];
+          if (stack->id != BLOCK_AIR && stack->count > 0 &&
               InWorld(target.placeX, target.placeY, target.placeZ) &&
-              GetBlock(target.placeX, target.placeY, target.placeZ) == BLOCK_AIR &&
+              GetBlock(target.placeX, target.placeY, target.placeZ) ==
+                  BLOCK_AIR &&
               !PlacementOverlapsPlayer(&player, target.placeX, target.placeY,
                                        target.placeZ)) {
-            SetBlock(target.placeX, target.placeY, target.placeZ, placing);
-            inventory[selectedSlot]--;
+            SetBlock(target.placeX, target.placeY, target.placeZ, stack->id);
+            stack->count--;
+            if (stack->count == 0)
+              stack->id = BLOCK_AIR;
             changedWorld = true;
+            PlayGameSound(&audio, audio.placeSound);
           }
         }
         if (changedWorld)
-          BuildWorldModels();
+          RebuildDirtyChunkMeshes();
       }
     }
 
@@ -1163,15 +1232,47 @@ int main(void) {
           .position = eye,
           .target = {eye.x + look.x, eye.y + look.y, eye.z + look.z},
           .up = {0.0f, 1.0f, 0.0f},
-          .fovy = 75.0f,
+          .fovy = (float)settings.fovDegrees,
           .projection = CAMERA_PERSPECTIVE};
       RayHit target = CastBlockRay(eye, look);
 
       ClearBackground((Color){135, 190, 235, 255});
+      Frustum frustum =
+          MakeFrustum(eye, look, camera.up, camera.fovy,
+                      (float)GetScreenWidth() / (float)GetScreenHeight());
+      int chunksDrawn = 0;
+      int chunksTotal = 0;
+
       BeginMode3D(camera);
-      for (int id = 1; id < BLOCK_COUNT; id++) {
-        if (worldModels[id].meshCount > 0)
-          DrawModel(worldModels[id], (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
+      for (int cx = 0; cx < CHUNKS_X; cx++) {
+        for (int cy = 0; cy < CHUNKS_Y; cy++) {
+          for (int cz = 0; cz < CHUNKS_Z; cz++) {
+            const Model *models = chunkRenders[cx][cy][cz].models;
+            bool hasMesh = false;
+            for (int id = 1; id < BLOCK_COUNT; id++) {
+              if (models[id].meshCount > 0) {
+                hasMesh = true;
+                break;
+              }
+            }
+            if (!hasMesh)
+              continue;
+
+            chunksTotal++;
+            Vector3 min = {(float)(cx * CHUNK_SIZE), (float)(cy * CHUNK_SIZE),
+                           (float)(cz * CHUNK_SIZE)};
+            Vector3 max = {min.x + CHUNK_SIZE, min.y + CHUNK_SIZE,
+                           min.z + CHUNK_SIZE};
+            if (!FrustumVisible(&frustum, min, max))
+              continue;
+
+            chunksDrawn++;
+            for (int id = 1; id < BLOCK_COUNT; id++) {
+              if (models[id].meshCount > 0)
+                DrawModel(models[id], (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
+            }
+          }
+        }
       }
       if (target.hit) {
         DrawCubeWires(
@@ -1184,9 +1285,10 @@ int main(void) {
       int centerY = GetScreenHeight() / 2;
       DrawLine(centerX - 7, centerY, centerX + 7, centerY, RAYWHITE);
       DrawLine(centerX, centerY - 7, centerX, centerY + 7, RAYWHITE);
-      DrawHotbar(selectedSlot, inventory);
+      DrawHotbar(selectedSlot, hotbar);
       if (debugMode)
-        DrawDebug(&player, hotbarBlocks[selectedSlot], inventory, target);
+        DrawDebug(&player, hotbar, selectedSlot, target, chunksDrawn,
+                  chunksTotal);
     } else if (screen == SCREEN_MAIN_MENU) {
       DrawMainMenu(menuBackground, hasMenuBackground, menuLogo, hasMenuLogo);
     } else {
@@ -1196,9 +1298,12 @@ int main(void) {
     EndDrawing();
   }
 
-  if (autoSaveOnExit && !SaveGame(&player, inventory, selectedSlot))
+  if (!SaveGame(SAVE_FILE, SAVE_TEMP_FILE, &world, &player, hotbar,
+                HOTBAR_SIZE, selectedSlot))
     TraceLog(LOG_WARNING, "Could not save world to %s on exit.", SAVE_FILE);
-  UnloadWorldModels();
+
+  UnloadAllChunkModels();
+  WorldFree(&world);
   for (int id = 1; id < BLOCK_COUNT; id++) {
     if (blockTextureLoaded[id])
       UnloadTexture(blockTextures[id]);
@@ -1207,6 +1312,7 @@ int main(void) {
     UnloadTexture(menuBackground);
   if (hasMenuLogo)
     UnloadTexture(menuLogo);
+  UnloadGameAudio(&audio);
   CloseWindow();
   return 0;
 }

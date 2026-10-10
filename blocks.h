@@ -5,10 +5,11 @@
 #include <stdint.h>
 
 #define VEYLORIA_BLOCK_NAMESPACE "veyloria"
+#define INVENTORY_CAPACITY 64
 
 // SUMMARY: Declares stable block IDs and the namespaced block-definition interface.
 
-typedef uint16_t BlockId;
+typedef uint8_t BlockId;
 
 typedef enum BlockType {
     BLOCK_AIR = 0,
@@ -20,8 +21,12 @@ typedef enum BlockType {
 typedef struct BlockDef {
     const char *name;
     bool solid;
-    float hardness;
 } BlockDef;
+
+typedef struct ItemStack {
+    BlockId id;
+    int count;
+} ItemStack;
 
 extern const BlockDef blockDefs[BLOCK_COUNT];
 

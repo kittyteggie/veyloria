@@ -2,3 +2,6 @@ bin/
 *.sav
 *.tmp
 *.cfg
+*.o
+*.d
+screenshot*.png
