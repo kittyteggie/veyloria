@@ -87,8 +87,10 @@ typedef enum ScreenState {
 } ScreenState;
 
 static World world;
-static Model worldModel = {0};
-static bool worldModelLoaded;
+static Model worldModels[BLOCK_COUNT];
+static bool worldModelsLoaded;
+static Texture2D blockTextures[BLOCK_COUNT];
+static bool blockTextureLoaded[BLOCK_COUNT];
 static const Resolution resolutions[RESOLUTION_COUNT] = {
     {640, 480}, {WINDOW_WIDTH, WINDOW_HEIGHT}, {1024, 768}};
 static const float sensitivities[SENSITIVITY_COUNT] = {
@@ -161,7 +163,14 @@ static void EnsureMeshCapacity(MeshBuilder *builder, int required) {
   builder->capacity = newCapacity;
 }
 
-static Color BlockFaceColor(BlockId id, int face) {
+static Color BlockFaceColor(BlockId id, int face, bool textured) {
+  static const float shade[] = {0.78f, 0.54f, 1.0f, 0.58f, 0.88f, 0.70f};
+  float factor = shade[face];
+  if (textured) {
+    unsigned char brightness = (unsigned char)(255.0f * factor);
+    return (Color){brightness, brightness, brightness, 255};
+  }
+
   Color base;
   if (id == BLOCK_GRASS) {
     base =
@@ -170,15 +179,13 @@ static Color BlockFaceColor(BlockId id, int face) {
     base = (Color){132, 136, 143, 255};
   }
 
-  static const float shade[] = {0.78f, 0.54f, 1.0f, 0.58f, 0.88f, 0.70f};
-  float factor = shade[face];
   return (Color){(unsigned char)(base.r * factor),
                  (unsigned char)(base.g * factor),
                  (unsigned char)(base.b * factor), 255};
 }
 
 static void AddFace(MeshBuilder *builder, int x, int y, int z, BlockId id,
-                    int face) {
+                    int face, bool textured) {
   // Each face is four corners in outward-facing winding order.
   static const Vector3 corners[6][4] = {
       {{1, 0, 0}, {1, 1, 0}, {1, 1, 1}, {1, 0, 1}}, // +X
@@ -191,7 +198,7 @@ static void AddFace(MeshBuilder *builder, int x, int y, int z, BlockId id,
   static const Vector3 normals[6] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
   static const int order[6] = {0, 1, 2, 0, 2, 3};
-  Color color = BlockFaceColor(id, face);
+  Color color = BlockFaceColor(id, face, textured);
 
   EnsureMeshCapacity(builder, builder->vertexCount + 6);
   for (int i = 0; i < 6; i++) {
@@ -214,10 +221,21 @@ static void AddFace(MeshBuilder *builder, int x, int y, int z, BlockId id,
   }
 }
 
-static Model BuildWorldModel(void) {
+static void UnloadWorldModels(void) {
+  if (!worldModelsLoaded)
+    return;
+  for (int id = 1; id < BLOCK_COUNT; id++) {
+    if (worldModels[id].meshCount > 0)
+      UnloadModel(worldModels[id]);
+  }
+  memset(worldModels, 0, sizeof(worldModels));
+  worldModelsLoaded = false;
+}
+
+static void BuildWorldModels(void) {
   static const int neighbor[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
-  MeshBuilder builder = {0};
+  MeshBuilder builders[BLOCK_COUNT] = {0};
 
   for (int x = 0; x < WORLD_WIDTH; x++) {
     for (int z = 0; z < WORLD_DEPTH; z++) {
@@ -230,27 +248,38 @@ static Model BuildWorldModel(void) {
           if (!blockDefs[GetBlock(x + neighbor[face][0], y + neighbor[face][1],
                                   z + neighbor[face][2])]
                    .solid) {
-            AddFace(&builder, x, y, z, id, face);
+            AddFace(&builders[id], x, y, z, id, face,
+                    blockTextureLoaded[id]);
           }
         }
       }
     }
   }
 
-  Mesh mesh = {0};
-  mesh.vertexCount = builder.vertexCount;
-  mesh.triangleCount = builder.vertexCount / 3;
-  mesh.vertices = builder.vertices;
-  mesh.normals = builder.normals;
-  mesh.texcoords = builder.texcoords;
-  mesh.colors = builder.colors;
-  UploadMesh(&mesh, false);
+  Model newModels[BLOCK_COUNT] = {0};
+  for (int id = 1; id < BLOCK_COUNT; id++) {
+    MeshBuilder *builder = &builders[id];
+    if (builder->vertexCount == 0)
+      continue;
 
-  Model newModel = LoadModelFromMesh(mesh);
-  if (worldModelLoaded)
-    UnloadModel(worldModel);
-  worldModelLoaded = true;
-  return newModel;
+    Mesh mesh = {0};
+    mesh.vertexCount = builder->vertexCount;
+    mesh.triangleCount = builder->vertexCount / 3;
+    mesh.vertices = builder->vertices;
+    mesh.normals = builder->normals;
+    mesh.texcoords = builder->texcoords;
+    mesh.colors = builder->colors;
+    UploadMesh(&mesh, false);
+    newModels[id] = LoadModelFromMesh(mesh);
+    if (blockTextureLoaded[id] && newModels[id].materialCount > 0) {
+      SetMaterialTexture(&newModels[id].materials[0], MATERIAL_MAP_DIFFUSE,
+                         blockTextures[id]);
+    }
+  }
+
+  UnloadWorldModels();
+  memcpy(worldModels, newModels, sizeof(worldModels));
+  worldModelsLoaded = true;
 }
 
 static bool WriteU32(FILE *file, uint32_t value) {
@@ -909,15 +938,15 @@ static void DrawConfigMenu(Texture2D background, bool hasBackground,
   DrawMenuButton(ConfigBackBounds(), "BACK");
 }
 
-static bool TryLoadMenuTexture(const char *path, Texture2D *texture) {
+static bool TryLoadAssetTexture(const char *path, Texture2D *texture) {
   if (!FileExists(path))
     return false;
   *texture = LoadTexture(path);
   return texture->id > 0;
 }
 
-static bool LoadMenuTexture(const char *relativePath, Texture2D *texture) {
-  if (TryLoadMenuTexture(relativePath, texture))
+static bool LoadAssetTexture(const char *relativePath, Texture2D *texture) {
+  if (TryLoadAssetTexture(relativePath, texture))
     return true;
 
   const char *applicationDirectory = GetApplicationDirectory();
@@ -930,12 +959,27 @@ static bool LoadMenuTexture(const char *relativePath, Texture2D *texture) {
 
   char candidate[1024];
   snprintf(candidate, sizeof(candidate), "%s%s", baseDirectory, relativePath);
-  if (TryLoadMenuTexture(candidate, texture))
+  if (TryLoadAssetTexture(candidate, texture))
     return true;
 
   snprintf(candidate, sizeof(candidate), "%s../%s", baseDirectory,
            relativePath);
-  return TryLoadMenuTexture(candidate, texture);
+  return TryLoadAssetTexture(candidate, texture);
+}
+
+static void LoadBlockTextures(void) {
+  for (int id = 1; id < BLOCK_COUNT; id++) {
+    const char *name = blockDefs[id].name;
+    const char *separator = strrchr(name, ':');
+    const char *fileName = separator ? separator + 1 : name;
+    char texturePath[256];
+    snprintf(texturePath, sizeof(texturePath), "assets/%s.png", fileName);
+    blockTextureLoaded[id] =
+        LoadAssetTexture(texturePath, &blockTextures[id]);
+    if (!blockTextureLoaded[id])
+      TraceLog(LOG_INFO, "No texture at %s; using the default block color.",
+               texturePath);
+  }
 }
 
 int main(void) {
@@ -946,7 +990,7 @@ int main(void) {
 
   SetConfigFlags(FLAG_MSAA_4X_HINT);
   InitWindow(initialResolution.width, initialResolution.height,
-             "Veyloria proto-26.10.09-02");
+             "Veyloria proto-26.10.09-03");
   SetExitKey(KEY_NULL);
   SetTargetFPS(60);
   EnableCursor();
@@ -954,8 +998,9 @@ int main(void) {
   Texture2D menuBackground = {0};
   Texture2D menuLogo = {0};
   bool hasMenuBackground =
-      LoadMenuTexture(MENU_BACKGROUND_PATH, &menuBackground);
-  bool hasMenuLogo = LoadMenuTexture(MENU_LOGO_PATH, &menuLogo);
+      LoadAssetTexture(MENU_BACKGROUND_PATH, &menuBackground);
+  bool hasMenuLogo = LoadAssetTexture(MENU_LOGO_PATH, &menuLogo);
+  LoadBlockTextures();
 
   InitializeWorld();
 
@@ -979,7 +1024,7 @@ int main(void) {
              SAVE_FILE);
     autoSaveOnExit = false;
   }
-  worldModel = BuildWorldModel();
+  BuildWorldModels();
 
   while (!WindowShouldClose() && !exitRequested) {
     float deltaTime = GetFrameTime();
@@ -1063,7 +1108,7 @@ int main(void) {
         }
         if (IsKeyPressed(KEY_F9)) {
           if (LoadGame(&player, inventory, &selectedSlot)) {
-            worldModel = BuildWorldModel();
+            BuildWorldModels();
             autoSaveOnExit = true;
             TraceLog(LOG_INFO, "World loaded from %s.", SAVE_FILE);
           } else {
@@ -1101,7 +1146,7 @@ int main(void) {
           }
         }
         if (changedWorld)
-          worldModel = BuildWorldModel();
+          BuildWorldModels();
       }
     }
 
@@ -1124,7 +1169,10 @@ int main(void) {
 
       ClearBackground((Color){135, 190, 235, 255});
       BeginMode3D(camera);
-      DrawModel(worldModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
+      for (int id = 1; id < BLOCK_COUNT; id++) {
+        if (worldModels[id].meshCount > 0)
+          DrawModel(worldModels[id], (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
+      }
       if (target.hit) {
         DrawCubeWires(
             (Vector3){target.x + 0.5f, target.y + 0.5f, target.z + 0.5f},
@@ -1150,8 +1198,11 @@ int main(void) {
 
   if (autoSaveOnExit && !SaveGame(&player, inventory, selectedSlot))
     TraceLog(LOG_WARNING, "Could not save world to %s on exit.", SAVE_FILE);
-  if (worldModelLoaded)
-    UnloadModel(worldModel);
+  UnloadWorldModels();
+  for (int id = 1; id < BLOCK_COUNT; id++) {
+    if (blockTextureLoaded[id])
+      UnloadTexture(blockTextures[id]);
+  }
   if (hasMenuBackground)
     UnloadTexture(menuBackground);
   if (hasMenuLogo)
