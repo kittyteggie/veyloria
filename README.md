@@ -1,5 +1,8 @@
 # Veyloria
 
+![Logo](/assets/logo.png)
+![Screenshot](preview.png)
+
 A small first-person voxel prototype written in C with raylib.
 
 ## Build and run
