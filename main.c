@@ -16,13 +16,26 @@
 #define PLAYER_RADIUS 0.30f
 #define PLAYER_HEIGHT 1.80f
 #define PLAYER_EYE_HEIGHT 1.62f
-#define MOUSE_SENSITIVITY 0.0015f
 #define REACH_DISTANCE 6.0f
 #define INVENTORY_CAPACITY 64
 #define PI 3.14159265358979323846f
+#define DEFAULT_RESOLUTION_INDEX 1
+#define DEFAULT_SENSITIVITY_INDEX 2
+#define RESOLUTION_COUNT 3
+#define SENSITIVITY_COUNT 8
+#define SETTINGS_FILE "veyloria.cfg"
+#define SETTINGS_TEMP_FILE "veyloria.cfg.tmp"
+#define MENU_BACKGROUND_PATH "assets/menubg.png"
+#define MENU_LOGO_PATH "assets/logo.png"
+#define MENU_LOGO_WIDTH 384
+#define MENU_LOGO_HEIGHT 192
+#define SAVE_FILE "veyloria-world.sav"
+#define SAVE_TEMP_FILE "veyloria-world.sav.tmp"
+#define SAVE_VERSION 2u
+#define SAVE_LEGACY_VERSION 1u
+#define SAVE_BUFFER_SIZE 65536
 
-// SUMMARY: Runs a 256-cubed first-person voxel world with a three-layer base,
-// block editing, and a hotbar.
+// SUMMARY: Runs the voxel game, main/config menus, and world/settings persistence.
 
 typedef struct World {
   BlockId blocks[WORLD_WIDTH][WORLD_HEIGHT][WORLD_DEPTH];
@@ -57,9 +70,30 @@ typedef struct MeshBuilder {
   int capacity;
 } MeshBuilder;
 
+typedef struct Resolution {
+  int width;
+  int height;
+} Resolution;
+
+typedef struct GameSettings {
+  int resolutionIndex;
+  int sensitivityIndex;
+} GameSettings;
+
+typedef enum ScreenState {
+  SCREEN_MAIN_MENU,
+  SCREEN_CONFIG,
+  SCREEN_PLAYING
+} ScreenState;
+
 static World world;
 static Model worldModel = {0};
 static bool worldModelLoaded;
+static const Resolution resolutions[RESOLUTION_COUNT] = {
+    {640, 480}, {WINDOW_WIDTH, WINDOW_HEIGHT}, {1024, 768}};
+static const float sensitivities[SENSITIVITY_COUNT] = {
+    0.0005f, 0.0010f, 0.0015f, 0.0020f,
+    0.0025f, 0.0030f, 0.0035f, 0.0040f};
 
 static bool InWorld(int x, int y, int z) {
   return x >= 0 && x < WORLD_WIDTH && y >= 0 && y < WORLD_HEIGHT && z >= 0 &&
@@ -219,6 +253,257 @@ static Model BuildWorldModel(void) {
   return newModel;
 }
 
+static bool WriteU32(FILE *file, uint32_t value) {
+  uint8_t bytes[4] = {(uint8_t)value, (uint8_t)(value >> 8),
+                      (uint8_t)(value >> 16), (uint8_t)(value >> 24)};
+  return fwrite(bytes, 1, sizeof(bytes), file) == sizeof(bytes);
+}
+
+static bool ReadU32(FILE *file, uint32_t *value) {
+  uint8_t bytes[4];
+  if (fread(bytes, 1, sizeof(bytes), file) != sizeof(bytes))
+    return false;
+
+  *value = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+  return true;
+}
+
+static bool WriteFloat(FILE *file, float value) {
+  uint32_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return WriteU32(file, bits);
+}
+
+static bool ReadFloat(FILE *file, float *value) {
+  uint32_t bits;
+  if (!ReadU32(file, &bits))
+    return false;
+  memcpy(value, &bits, sizeof(bits));
+  return true;
+}
+
+static bool SaveGame(const Player *player, const int inventory[2],
+                     int selectedSlot) {
+  static const uint8_t magic[8] = {'V', 'E', 'Y', 'L', 'O', 'R', 'I', 'A'};
+  size_t blockCount = (size_t)WORLD_WIDTH * WORLD_HEIGHT * WORLD_DEPTH;
+  uint8_t *blockData = malloc(blockCount);
+  if (!blockData)
+    return false;
+
+  bool success = true;
+  size_t index = 0;
+  for (int x = 0; success && x < WORLD_WIDTH; x++) {
+    for (int y = 0; success && y < WORLD_HEIGHT; y++) {
+      for (int z = 0; success && z < WORLD_DEPTH; z++) {
+        BlockId id = world.blocks[x][y][z];
+        if (id >= BLOCK_COUNT) {
+          success = false;
+          break;
+        }
+        blockData[index++] = (uint8_t)id;
+      }
+    }
+  }
+
+  int compressedSize = 0;
+  unsigned char *compressedData = NULL;
+  if (success)
+    compressedData = CompressData(blockData, (int)blockCount, &compressedSize);
+  free(blockData);
+  if (!compressedData || compressedSize <= 0) {
+    if (compressedData)
+      MemFree(compressedData);
+    return false;
+  }
+
+  FILE *file = fopen(SAVE_TEMP_FILE, "wb");
+  if (!file) {
+    MemFree(compressedData);
+    return false;
+  }
+
+  success = fwrite(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+            WriteU32(file, SAVE_VERSION) && WriteU32(file, WORLD_WIDTH) &&
+            WriteU32(file, WORLD_DEPTH) && WriteU32(file, WORLD_HEIGHT) &&
+            WriteFloat(file, player->feet.x) &&
+            WriteFloat(file, player->feet.y) &&
+            WriteFloat(file, player->feet.z) && WriteFloat(file, player->yaw) &&
+            WriteFloat(file, player->pitch) &&
+            WriteU32(file, (uint32_t)inventory[0]) &&
+            WriteU32(file, (uint32_t)inventory[1]) &&
+            WriteU32(file, (uint32_t)selectedSlot) &&
+            WriteU32(file, (uint32_t)compressedSize) &&
+            fwrite(compressedData, 1, (size_t)compressedSize, file) ==
+                (size_t)compressedSize;
+  MemFree(compressedData);
+  if (fclose(file) != 0)
+    success = false;
+
+  if (!success || rename(SAVE_TEMP_FILE, SAVE_FILE) != 0) {
+    remove(SAVE_TEMP_FILE);
+    return false;
+  }
+  return true;
+}
+
+static bool LoadGame(Player *player, int inventory[2], int *selectedSlot) {
+  static const uint8_t expectedMagic[8] = {'V', 'E', 'Y', 'L', 'O', 'R', 'I', 'A'};
+  FILE *file = fopen(SAVE_FILE, "rb");
+  if (!file)
+    return false;
+
+  uint8_t magic[8];
+  uint32_t version, width, depth, height;
+  uint32_t grassCount, stoneCount, savedSelectedSlot;
+  Player savedPlayer = {0};
+  bool valid = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+               memcmp(magic, expectedMagic, sizeof(magic)) == 0 &&
+               ReadU32(file, &version) && ReadU32(file, &width) &&
+               ReadU32(file, &depth) && ReadU32(file, &height) &&
+               ReadFloat(file, &savedPlayer.feet.x) &&
+               ReadFloat(file, &savedPlayer.feet.y) &&
+               ReadFloat(file, &savedPlayer.feet.z) &&
+               ReadFloat(file, &savedPlayer.yaw) &&
+               ReadFloat(file, &savedPlayer.pitch) &&
+               ReadU32(file, &grassCount) && ReadU32(file, &stoneCount) &&
+               ReadU32(file, &savedSelectedSlot);
+
+  valid = valid &&
+          (version == SAVE_LEGACY_VERSION || version == SAVE_VERSION) &&
+          width == WORLD_WIDTH &&
+          depth == WORLD_DEPTH && height == WORLD_HEIGHT &&
+          isfinite(savedPlayer.feet.x) && isfinite(savedPlayer.feet.y) &&
+          isfinite(savedPlayer.feet.z) && isfinite(savedPlayer.yaw) &&
+          isfinite(savedPlayer.pitch) &&
+          savedPlayer.feet.x >= PLAYER_RADIUS &&
+          savedPlayer.feet.x <= WORLD_WIDTH - PLAYER_RADIUS &&
+          savedPlayer.feet.y >= 0.0f &&
+          savedPlayer.feet.y <= WORLD_HEIGHT - PLAYER_HEIGHT &&
+          savedPlayer.feet.z >= PLAYER_RADIUS &&
+          savedPlayer.feet.z <= WORLD_DEPTH - PLAYER_RADIUS &&
+          savedPlayer.pitch >= -1.5f && savedPlayer.pitch <= 1.5f &&
+          grassCount <= INVENTORY_CAPACITY && stoneCount <= INVENTORY_CAPACITY &&
+          savedSelectedSlot < 2;
+
+  size_t blockCount = (size_t)WORLD_WIDTH * WORLD_HEIGHT * WORLD_DEPTH;
+  uint8_t *blockData = NULL;
+  if (valid) {
+    blockData = malloc(blockCount);
+    valid = blockData != NULL;
+  }
+
+  if (valid && version == SAVE_LEGACY_VERSION) {
+    size_t loadedCount = 0;
+    while (valid && loadedCount < blockCount) {
+      size_t remaining = blockCount - loadedCount;
+      size_t amount = remaining < SAVE_BUFFER_SIZE ? remaining : SAVE_BUFFER_SIZE;
+      if (fread(blockData + loadedCount, 1, amount, file) != amount) {
+        valid = false;
+        break;
+      }
+      loadedCount += amount;
+    }
+  } else if (valid) {
+    uint32_t compressedSize = 0;
+    valid = ReadU32(file, &compressedSize) && compressedSize > 0 &&
+            (uint64_t)compressedSize <= (uint64_t)blockCount * 2;
+    unsigned char *compressedData = NULL;
+    if (valid) {
+      compressedData = malloc(compressedSize);
+      valid = compressedData != NULL;
+    }
+    if (valid)
+      valid = fread(compressedData, 1, compressedSize, file) == compressedSize;
+    if (valid) {
+      int decompressedSize = 0;
+      unsigned char *decompressedData =
+          DecompressData(compressedData, (int)compressedSize, &decompressedSize);
+      valid = decompressedData && decompressedSize == (int)blockCount;
+      if (valid)
+        memcpy(blockData, decompressedData, blockCount);
+      if (decompressedData)
+        MemFree(decompressedData);
+    }
+    free(compressedData);
+  }
+
+  if (valid && (fgetc(file) != EOF || ferror(file)))
+    valid = false;
+  if (fclose(file) != 0)
+    valid = false;
+
+  if (valid) {
+    for (size_t i = 0; i < blockCount; i++) {
+      if (blockData[i] >= BLOCK_COUNT) {
+        valid = false;
+        break;
+      }
+    }
+  }
+
+  if (!valid) {
+    free(blockData);
+    return false;
+  }
+
+  size_t index = 0;
+  for (int x = 0; x < WORLD_WIDTH; x++) {
+    for (int y = 0; y < WORLD_HEIGHT; y++) {
+      for (int z = 0; z < WORLD_DEPTH; z++)
+        world.blocks[x][y][z] = (BlockId)blockData[index++];
+    }
+  }
+  free(blockData);
+  for (int x = 0; x < WORLD_WIDTH; x++) {
+    for (int z = 0; z < WORLD_DEPTH; z++) {
+      int highestY = WORLD_HEIGHT - 1;
+      while (highestY >= 0 && world.blocks[x][highestY][z] == BLOCK_AIR)
+        highestY--;
+      world.highestBlockY[x][z] = highestY;
+    }
+  }
+
+  savedPlayer.verticalVelocity = 0.0f;
+  savedPlayer.grounded = false;
+  *player = savedPlayer;
+  inventory[0] = (int)grassCount;
+  inventory[1] = (int)stoneCount;
+  *selectedSlot = (int)savedSelectedSlot;
+  return true;
+}
+
+static void LoadSettings(GameSettings *settings) {
+  FILE *file = fopen(SETTINGS_FILE, "r");
+  if (!file)
+    return;
+
+  int resolutionIndex, sensitivityIndex;
+  if (fscanf(file, "%d %d", &resolutionIndex, &sensitivityIndex) == 2 &&
+      resolutionIndex >= 0 && resolutionIndex < RESOLUTION_COUNT &&
+      sensitivityIndex >= 0 && sensitivityIndex < SENSITIVITY_COUNT) {
+    settings->resolutionIndex = resolutionIndex;
+    settings->sensitivityIndex = sensitivityIndex;
+  }
+  fclose(file);
+}
+
+static bool SaveSettings(const GameSettings *settings) {
+  FILE *file = fopen(SETTINGS_TEMP_FILE, "w");
+  if (!file)
+    return false;
+
+  bool success = fprintf(file, "%d %d\n", settings->resolutionIndex,
+                         settings->sensitivityIndex) > 0;
+  if (fclose(file) != 0)
+    success = false;
+  if (!success || rename(SETTINGS_TEMP_FILE, SETTINGS_FILE) != 0) {
+    remove(SETTINGS_TEMP_FILE);
+    return false;
+  }
+  return true;
+}
+
 static Vector3 PlayerEye(const Player *player) {
   return (Vector3){player->feet.x, player->feet.y + PLAYER_EYE_HEIGHT,
                    player->feet.z};
@@ -293,11 +578,12 @@ static void MovePlayerAxis(Player *player, float amount, int axis) {
   }
 }
 
-static void UpdatePlayer(Player *player, float deltaTime, bool applyMouseLook) {
+static void UpdatePlayer(Player *player, float deltaTime, bool applyMouseLook,
+                         float mouseSensitivity) {
   Vector2 mouse = GetMouseDelta();
   if (applyMouseLook) {
-    player->yaw += mouse.x * MOUSE_SENSITIVITY;
-    player->pitch -= mouse.y * MOUSE_SENSITIVITY;
+    player->yaw += mouse.x * mouseSensitivity;
+    player->pitch -= mouse.y * mouseSensitivity;
   }
   if (player->pitch > 1.50f)
     player->pitch = 1.50f;
@@ -480,14 +766,198 @@ static void DrawDebug(const Player *player, BlockId heldBlock,
   DrawText(line, 22, 131, 16, RAYWHITE);
 }
 
+static Rectangle MainMenuButtonBounds(int index) {
+  float width = 260.0f;
+  float height = 52.0f;
+  float x = (GetScreenWidth() - width) * 0.5f;
+  float buttonsHeight = 52.0f * 3.0f + 12.0f * 2.0f;
+  float contentHeight = MENU_LOGO_HEIGHT + 24.0f + buttonsHeight;
+  float top = (GetScreenHeight() - contentHeight) * 0.5f;
+  float y = top + MENU_LOGO_HEIGHT + 24.0f + index * 64.0f;
+  return (Rectangle){x, y, width, height};
+}
+
+static float ConfigRowY(int row) {
+  return GetScreenHeight() * 0.5f - 85.0f + row * 80.0f;
+}
+
+static Rectangle ConfigArrowBounds(int row, bool rightArrow) {
+  float centerX = GetScreenWidth() * 0.5f;
+  return (Rectangle){centerX + (rightArrow ? 165.0f : 35.0f), ConfigRowY(row),
+                     42.0f, 44.0f};
+}
+
+static Rectangle ConfigBackBounds(void) {
+  float width = 200.0f;
+  return (Rectangle){(GetScreenWidth() - width) * 0.5f,
+                     GetScreenHeight() - 82.0f, width, 48.0f};
+}
+
+static bool MenuButtonClicked(Rectangle bounds) {
+  return CheckCollisionPointRec(GetMousePosition(), bounds) &&
+         IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+static void DrawMenuButton(Rectangle bounds, const char *label) {
+  bool hovered = CheckCollisionPointRec(GetMousePosition(), bounds);
+  Color fill = hovered ? (Color){78, 105, 125, 245}
+                       : (Color){34, 43, 52, 230};
+  DrawRectangleRec(bounds, fill);
+  DrawRectangleLinesEx(bounds, hovered ? 3.0f : 2.0f,
+                       hovered ? (Color){235, 225, 190, 255}
+                               : (Color){175, 180, 182, 255});
+  int fontSize = 24;
+  int textWidth = MeasureText(label, fontSize);
+  DrawText(label, (int)(bounds.x + (bounds.width - textWidth) * 0.5f),
+           (int)(bounds.y + (bounds.height - fontSize) * 0.5f), fontSize,
+           RAYWHITE);
+}
+
+static void DrawMenuBackground(Texture2D background, bool hasBackground) {
+  int width = GetScreenWidth();
+  int height = GetScreenHeight();
+  if (hasBackground && background.width > 0 && background.height > 0) {
+    Rectangle source = {0.0f, 0.0f, (float)background.width,
+                        (float)background.height};
+    Rectangle destination = {0.0f, 0.0f, (float)width, (float)height};
+    float sourceAspect = (float)background.width / background.height;
+    float destinationAspect = (float)width / height;
+    // Center-crop the wider image so it fills a 4:3 window without distortion.
+    if (sourceAspect > destinationAspect) {
+      source.width = background.height * destinationAspect;
+      source.x = (background.width - source.width) * 0.5f;
+    } else if (sourceAspect < destinationAspect) {
+      source.height = background.width / destinationAspect;
+      source.y = (background.height - source.height) * 0.5f;
+    }
+    DrawTexturePro(background, source, destination, (Vector2){0.0f, 0.0f}, 0.0f,
+                   WHITE);
+  } else {
+    DrawRectangleGradientV(0, 0, width, height, (Color){72, 111, 142, 255},
+                           (Color){31, 43, 49, 255});
+  }
+  DrawRectangle(0, 0, width, height, (Color){0, 0, 0, 75});
+}
+
+static void DrawMenuLogo(Texture2D logo, bool hasLogo, Rectangle bounds) {
+  if (hasLogo) {
+    float scaleX = bounds.width / logo.width;
+    float scaleY = bounds.height / logo.height;
+    float scale = scaleX < scaleY ? scaleX : scaleY;
+    float width = logo.width * scale;
+    float height = logo.height * scale;
+    Rectangle source = {0.0f, 0.0f, (float)logo.width, (float)logo.height};
+    Rectangle destination = {
+        bounds.x + (bounds.width - width) * 0.5f,
+        bounds.y + (bounds.height - height) * 0.5f,
+        width,
+        height};
+    DrawTexturePro(logo, source, destination, (Vector2){0.0f, 0.0f}, 0.0f,
+                   WHITE);
+  } else {
+    const char *title = "VEYLORIA";
+    int fontSize = bounds.height > 120.0f ? 38 : 26;
+    int x = (int)(bounds.x + (bounds.width - MeasureText(title, fontSize)) * 0.5f);
+    int y = (int)(bounds.y + (bounds.height - fontSize) * 0.5f);
+    DrawText(title, x, y, fontSize, RAYWHITE);
+  }
+}
+
+static void DrawMainMenu(Texture2D background, bool hasBackground, Texture2D logo,
+                         bool hasLogo) {
+  DrawMenuBackground(background, hasBackground);
+  Rectangle logoBounds = {
+      (GetScreenWidth() - MENU_LOGO_WIDTH) * 0.5f,
+      (MainMenuButtonBounds(0).y - 24.0f - MENU_LOGO_HEIGHT),
+      (float)MENU_LOGO_WIDTH,
+      (float)MENU_LOGO_HEIGHT};
+  DrawMenuLogo(logo, hasLogo, logoBounds);
+  DrawMenuButton(MainMenuButtonBounds(0), "PLAY");
+  DrawMenuButton(MainMenuButtonBounds(1), "CONFIG");
+  DrawMenuButton(MainMenuButtonBounds(2), "EXIT");
+}
+
+static void DrawConfigMenu(Texture2D background, bool hasBackground,
+                           Texture2D logo, bool hasLogo,
+                           const GameSettings *settings) {
+  DrawMenuBackground(background, hasBackground);
+  Rectangle configLogoBounds = {
+      (GetScreenWidth() - 192.0f) * 0.5f, 20.0f, 192.0f, 96.0f};
+  DrawMenuLogo(logo, hasLogo, configLogoBounds);
+  const char *heading = "CONFIG";
+  DrawText(heading, (GetScreenWidth() - MeasureText(heading, 24)) / 2, 122, 24,
+           RAYWHITE);
+
+  int centerX = GetScreenWidth() / 2;
+  float rowY = ConfigRowY(0);
+  DrawText("Resolution", centerX - 225, (int)rowY + 12, 20, RAYWHITE);
+  DrawMenuButton(ConfigArrowBounds(0, false), "<");
+  DrawMenuButton(ConfigArrowBounds(0, true), ">");
+  const Resolution resolution = resolutions[settings->resolutionIndex];
+  const char *resolutionText = TextFormat("%d x %d", resolution.width,
+                                          resolution.height);
+  DrawText(resolutionText, centerX + 82, (int)rowY + 13, 18, RAYWHITE);
+
+  rowY = ConfigRowY(1);
+  DrawText("Mouse sensitivity", centerX - 225, (int)rowY + 12, 20, RAYWHITE);
+  DrawMenuButton(ConfigArrowBounds(1, false), "<");
+  DrawMenuButton(ConfigArrowBounds(1, true), ">");
+  const char *sensitivityText =
+      TextFormat("%.4f", sensitivities[settings->sensitivityIndex]);
+  DrawText(sensitivityText, centerX + 82, (int)rowY + 13, 18, RAYWHITE);
+
+  DrawMenuButton(ConfigBackBounds(), "BACK");
+}
+
+static bool TryLoadMenuTexture(const char *path, Texture2D *texture) {
+  if (!FileExists(path))
+    return false;
+  *texture = LoadTexture(path);
+  return texture->id > 0;
+}
+
+static bool LoadMenuTexture(const char *relativePath, Texture2D *texture) {
+  if (TryLoadMenuTexture(relativePath, texture))
+    return true;
+
+  const char *applicationDirectory = GetApplicationDirectory();
+  char baseDirectory[512];
+  size_t directoryLength = strlen(applicationDirectory);
+  snprintf(baseDirectory, sizeof(baseDirectory), "%s%s", applicationDirectory,
+           directoryLength > 0 && applicationDirectory[directoryLength - 1] == '/'
+               ? ""
+               : "/");
+
+  char candidate[1024];
+  snprintf(candidate, sizeof(candidate), "%s%s", baseDirectory, relativePath);
+  if (TryLoadMenuTexture(candidate, texture))
+    return true;
+
+  snprintf(candidate, sizeof(candidate), "%s../%s", baseDirectory,
+           relativePath);
+  return TryLoadMenuTexture(candidate, texture);
+}
+
 int main(void) {
+  GameSettings settings = {DEFAULT_RESOLUTION_INDEX,
+                           DEFAULT_SENSITIVITY_INDEX};
+  LoadSettings(&settings);
+  Resolution initialResolution = resolutions[settings.resolutionIndex];
+
   SetConfigFlags(FLAG_MSAA_4X_HINT);
-  InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Veyloria proto-26.10.09-01");
+  InitWindow(initialResolution.width, initialResolution.height,
+             "Veyloria proto-26.10.09-02");
+  SetExitKey(KEY_NULL);
   SetTargetFPS(60);
-  DisableCursor();
+  EnableCursor();
+
+  Texture2D menuBackground = {0};
+  Texture2D menuLogo = {0};
+  bool hasMenuBackground =
+      LoadMenuTexture(MENU_BACKGROUND_PATH, &menuBackground);
+  bool hasMenuLogo = LoadMenuTexture(MENU_LOGO_PATH, &menuLogo);
 
   InitializeWorld();
-  worldModel = BuildWorldModel();
 
   Player player = {
       .feet = {WORLD_WIDTH * 0.5f, TERRAIN_LAYERS, WORLD_DEPTH * 0.5f},
@@ -498,90 +968,194 @@ int main(void) {
   int inventory[2] = {32, 32};
   int selectedSlot = 0;
   bool debugMode = false;
-  bool mouseCaptured = true;
+  bool mouseCaptured = false;
+  bool autoSaveOnExit = true;
+  bool exitRequested = false;
+  ScreenState screen = SCREEN_MAIN_MENU;
   const BlockId hotbarBlocks[2] = {BLOCK_GRASS, BLOCK_STONE};
 
-  while (!WindowShouldClose()) {
+  if (FileExists(SAVE_FILE) && !LoadGame(&player, inventory, &selectedSlot)) {
+    TraceLog(LOG_WARNING, "Could not load %s; starting with a fresh world.",
+             SAVE_FILE);
+    autoSaveOnExit = false;
+  }
+  worldModel = BuildWorldModel();
+
+  while (!WindowShouldClose() && !exitRequested) {
     float deltaTime = GetFrameTime();
     if (deltaTime > 0.05f)
       deltaTime = 0.05f;
 
-    bool windowFocused = IsWindowFocused();
-    bool justRegainedFocus = windowFocused && !mouseCaptured;
-    if (windowFocused != mouseCaptured) {
-      if (windowFocused)
-        DisableCursor();
-      else
-        EnableCursor();
-      mouseCaptured = windowFocused;
+    bool justEnteredPlay = false;
+    if (screen == SCREEN_MAIN_MENU) {
+      if (IsKeyPressed(KEY_ESCAPE)) {
+        exitRequested = true;
+      } else if (MenuButtonClicked(MainMenuButtonBounds(0))) {
+        screen = SCREEN_PLAYING;
+        justEnteredPlay = true;
+      } else if (MenuButtonClicked(MainMenuButtonBounds(1))) {
+        screen = SCREEN_CONFIG;
+      } else if (MenuButtonClicked(MainMenuButtonBounds(2))) {
+        exitRequested = true;
+      }
+    } else if (screen == SCREEN_CONFIG) {
+      if (IsKeyPressed(KEY_ESCAPE) || MenuButtonClicked(ConfigBackBounds())) {
+        screen = SCREEN_MAIN_MENU;
+      } else {
+        bool settingsChanged = false;
+        if (MenuButtonClicked(ConfigArrowBounds(0, false))) {
+          settings.resolutionIndex =
+              (settings.resolutionIndex + RESOLUTION_COUNT - 1) %
+              RESOLUTION_COUNT;
+          settingsChanged = true;
+        } else if (MenuButtonClicked(ConfigArrowBounds(0, true))) {
+          settings.resolutionIndex =
+              (settings.resolutionIndex + 1) % RESOLUTION_COUNT;
+          settingsChanged = true;
+        }
+
+        if (MenuButtonClicked(ConfigArrowBounds(1, false))) {
+          if (settings.sensitivityIndex > 0)
+            settings.sensitivityIndex--;
+          settingsChanged = true;
+        } else if (MenuButtonClicked(ConfigArrowBounds(1, true))) {
+          if (settings.sensitivityIndex < SENSITIVITY_COUNT - 1)
+            settings.sensitivityIndex++;
+          settingsChanged = true;
+        }
+
+        if (settingsChanged) {
+          Resolution resolution = resolutions[settings.resolutionIndex];
+          SetWindowSize(resolution.width, resolution.height);
+          if (!SaveSettings(&settings))
+            TraceLog(LOG_WARNING, "Could not save %s.", SETTINGS_FILE);
+        }
+      }
     }
 
-    if (IsKeyPressed(KEY_ONE))
-      selectedSlot = 0;
-    if (IsKeyPressed(KEY_TWO))
-      selectedSlot = 1;
-    if (IsKeyPressed(KEY_F1))
-      debugMode = !debugMode;
-
-    UpdatePlayer(&player, deltaTime, windowFocused && !justRegainedFocus);
-
-    Vector3 eye = PlayerEye(&player);
-    RayHit target = CastBlockRay(eye, LookDirection(&player));
-    bool changedWorld = false;
-    if (target.hit && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-      BlockId broken = GetBlock(target.x, target.y, target.z);
-      int slot = (broken == BLOCK_GRASS) ? 0 : (broken == BLOCK_STONE) ? 1 : -1;
-      if (slot >= 0 && inventory[slot] < INVENTORY_CAPACITY) {
-        inventory[slot]++;
+    if (screen == SCREEN_PLAYING) {
+      bool windowFocused = IsWindowFocused();
+      bool justRegainedFocus = windowFocused && !mouseCaptured;
+      if (windowFocused != mouseCaptured) {
+        if (windowFocused)
+          DisableCursor();
+        else
+          EnableCursor();
+        mouseCaptured = windowFocused;
       }
-      SetBlock(target.x, target.y, target.z, BLOCK_AIR);
-      changedWorld = true;
-    } else if (target.hit && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-      BlockId placing = hotbarBlocks[selectedSlot];
-      if (inventory[selectedSlot] > 0 &&
-          InWorld(target.placeX, target.placeY, target.placeZ) &&
-          GetBlock(target.placeX, target.placeY, target.placeZ) == BLOCK_AIR &&
-          !PlacementOverlapsPlayer(&player, target.placeX, target.placeY,
-                                   target.placeZ)) {
-        SetBlock(target.placeX, target.placeY, target.placeZ, placing);
-        inventory[selectedSlot]--;
-        changedWorld = true;
+
+      if (IsKeyPressed(KEY_ESCAPE)) {
+        screen = SCREEN_MAIN_MENU;
+      } else {
+        if (IsKeyPressed(KEY_ONE))
+          selectedSlot = 0;
+        if (IsKeyPressed(KEY_TWO))
+          selectedSlot = 1;
+        if (IsKeyPressed(KEY_F1))
+          debugMode = !debugMode;
+        if (IsKeyPressed(KEY_F5)) {
+          if (SaveGame(&player, inventory, selectedSlot)) {
+            autoSaveOnExit = true;
+            TraceLog(LOG_INFO, "World saved to %s.", SAVE_FILE);
+          } else {
+            TraceLog(LOG_WARNING, "Could not save world to %s.", SAVE_FILE);
+          }
+        }
+        if (IsKeyPressed(KEY_F9)) {
+          if (LoadGame(&player, inventory, &selectedSlot)) {
+            worldModel = BuildWorldModel();
+            autoSaveOnExit = true;
+            TraceLog(LOG_INFO, "World loaded from %s.", SAVE_FILE);
+          } else {
+            TraceLog(LOG_WARNING, "Could not load world from %s.", SAVE_FILE);
+          }
+        }
+
+        UpdatePlayer(&player, deltaTime,
+                     windowFocused && !justRegainedFocus,
+                     sensitivities[settings.sensitivityIndex]);
+
+        Vector3 eye = PlayerEye(&player);
+        RayHit target = CastBlockRay(eye, LookDirection(&player));
+        bool changedWorld = false;
+        if (!justEnteredPlay && target.hit &&
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+          BlockId broken = GetBlock(target.x, target.y, target.z);
+          int slot = (broken == BLOCK_GRASS) ? 0
+                                             : (broken == BLOCK_STONE) ? 1 : -1;
+          if (slot >= 0 && inventory[slot] < INVENTORY_CAPACITY)
+            inventory[slot]++;
+          SetBlock(target.x, target.y, target.z, BLOCK_AIR);
+          changedWorld = true;
+        } else if (!justEnteredPlay && target.hit &&
+                   IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+          BlockId placing = hotbarBlocks[selectedSlot];
+          if (inventory[selectedSlot] > 0 &&
+              InWorld(target.placeX, target.placeY, target.placeZ) &&
+              GetBlock(target.placeX, target.placeY, target.placeZ) == BLOCK_AIR &&
+              !PlacementOverlapsPlayer(&player, target.placeX, target.placeY,
+                                       target.placeZ)) {
+            SetBlock(target.placeX, target.placeY, target.placeZ, placing);
+            inventory[selectedSlot]--;
+            changedWorld = true;
+          }
+        }
+        if (changedWorld)
+          worldModel = BuildWorldModel();
       }
     }
-    if (changedWorld)
-      worldModel = BuildWorldModel();
 
-    Vector3 look = LookDirection(&player);
-    Camera3D camera = {
-        .position = eye,
-        .target = {eye.x + look.x, eye.y + look.y, eye.z + look.z},
-        .up = {0.0f, 1.0f, 0.0f},
-        .fovy = 75.0f,
-        .projection = CAMERA_PERSPECTIVE};
+    if (screen != SCREEN_PLAYING && mouseCaptured) {
+      EnableCursor();
+      mouseCaptured = false;
+    }
 
     BeginDrawing();
-    ClearBackground((Color){135, 190, 235, 255});
-    BeginMode3D(camera);
-    DrawModel(worldModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
-    if (target.hit) {
-      DrawCubeWires(
-          (Vector3){target.x + 0.5f, target.y + 0.5f, target.z + 0.5f}, 1.01f,
-          1.01f, 1.01f, RAYWHITE);
-    }
-    EndMode3D();
+    if (screen == SCREEN_PLAYING) {
+      Vector3 eye = PlayerEye(&player);
+      Vector3 look = LookDirection(&player);
+      Camera3D camera = {
+          .position = eye,
+          .target = {eye.x + look.x, eye.y + look.y, eye.z + look.z},
+          .up = {0.0f, 1.0f, 0.0f},
+          .fovy = 75.0f,
+          .projection = CAMERA_PERSPECTIVE};
+      RayHit target = CastBlockRay(eye, look);
 
-    int centerX = GetScreenWidth() / 2;
-    int centerY = GetScreenHeight() / 2;
-    DrawLine(centerX - 7, centerY, centerX + 7, centerY, RAYWHITE);
-    DrawLine(centerX, centerY - 7, centerX, centerY + 7, RAYWHITE);
-    DrawHotbar(selectedSlot, inventory);
-    if (debugMode)
-      DrawDebug(&player, hotbarBlocks[selectedSlot], inventory, target);
+      ClearBackground((Color){135, 190, 235, 255});
+      BeginMode3D(camera);
+      DrawModel(worldModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
+      if (target.hit) {
+        DrawCubeWires(
+            (Vector3){target.x + 0.5f, target.y + 0.5f, target.z + 0.5f},
+            1.01f, 1.01f, 1.01f, RAYWHITE);
+      }
+      EndMode3D();
+
+      int centerX = GetScreenWidth() / 2;
+      int centerY = GetScreenHeight() / 2;
+      DrawLine(centerX - 7, centerY, centerX + 7, centerY, RAYWHITE);
+      DrawLine(centerX, centerY - 7, centerX, centerY + 7, RAYWHITE);
+      DrawHotbar(selectedSlot, inventory);
+      if (debugMode)
+        DrawDebug(&player, hotbarBlocks[selectedSlot], inventory, target);
+    } else if (screen == SCREEN_MAIN_MENU) {
+      DrawMainMenu(menuBackground, hasMenuBackground, menuLogo, hasMenuLogo);
+    } else {
+      DrawConfigMenu(menuBackground, hasMenuBackground, menuLogo, hasMenuLogo,
+                     &settings);
+    }
     EndDrawing();
   }
 
+  if (autoSaveOnExit && !SaveGame(&player, inventory, selectedSlot))
+    TraceLog(LOG_WARNING, "Could not save world to %s on exit.", SAVE_FILE);
   if (worldModelLoaded)
     UnloadModel(worldModel);
+  if (hasMenuBackground)
+    UnloadTexture(menuBackground);
+  if (hasMenuLogo)
+    UnloadTexture(menuLogo);
   CloseWindow();
   return 0;
 }
