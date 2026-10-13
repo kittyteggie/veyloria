@@ -161,6 +161,25 @@ static void DrawBlockIcon(Rectangle slot, BlockId id) {
   DrawRectangle(left, topY + size - 6, size, 6, side);
 }
 
+// Draws the crosshair with a mining progress bar underneath while breaking.
+void UiDrawCrosshair(float miningProgress) {
+  int centerX = GetScreenWidth() / 2;
+  int centerY = GetScreenHeight() / 2;
+  DrawLine(centerX - 7, centerY, centerX + 7, centerY, RAYWHITE);
+  DrawLine(centerX, centerY - 7, centerX, centerY + 7, RAYWHITE);
+
+  if (miningProgress > 0.0f) {
+    int width = 52;
+    int height = 6;
+    int x = centerX - width / 2;
+    int y = centerY + 16;
+    if (miningProgress > 1.0f)
+      miningProgress = 1.0f;
+    DrawRectangle(x - 1, y - 1, width + 2, height + 2, Fade(BLACK, 0.55f));
+    DrawRectangle(x, y, (int)((float)width * miningProgress), height, RAYWHITE);
+  }
+}
+
 void UiDrawHotbar(int selectedSlot, const ItemStack slots[]) {
   const int slotSize = 58;
   const int gap = 6;

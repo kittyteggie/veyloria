@@ -49,6 +49,19 @@ static void TestTextureResolution(void) {
   }
 }
 
+static void TestHardness(void) {
+  CHECK(blockDefs[BLOCK_AIR].hardness == 0.0f);
+  CHECK(blockDefs[BLOCK_GRASS].hardness > 0.0f);
+  CHECK(blockDefs[BLOCK_DIRT].hardness > 0.0f);
+  CHECK(blockDefs[BLOCK_STONE].hardness > 0.0f);
+  CHECK(blockDefs[BLOCK_WOOD].hardness > 0.0f);
+  CHECK(blockDefs[BLOCK_LEAVES].hardness > 0.0f);
+  // Softer blocks break faster than harder ones.
+  CHECK(blockDefs[BLOCK_LEAVES].hardness < blockDefs[BLOCK_GRASS].hardness);
+  CHECK(blockDefs[BLOCK_GRASS].hardness < blockDefs[BLOCK_STONE].hardness);
+  CHECK(blockDefs[BLOCK_STONE].hardness < blockDefs[BLOCK_WOOD].hardness);
+}
+
 static void TestItemStackGive(void) {
   ItemStack slots[2] = {{BLOCK_GRASS, 2}, {BLOCK_AIR, 0}};
 
@@ -77,6 +90,7 @@ static void TestItemStackGive(void) {
 int main(void) {
   TestFaceMapping();
   TestTextureResolution();
+  TestHardness();
   TestItemStackGive();
 
   printf("%d checks, %d failed\n", checksRun, checksFailed);

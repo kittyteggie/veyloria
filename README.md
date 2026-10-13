@@ -25,9 +25,11 @@ build files from `bin/`.
 - **F11:** Toggle fullscreen
 - **WASD:** Move
 - **Mouse:** Look around
+- **Mouse wheel:** Change hotbar slot
 - **Space:** Jump
-- **Left Shift:** Sprint
-- **Left mouse button:** Break a block
+- **Left Shift:** Sneak (slow, and you cannot walk off edges)
+- **Left Ctrl:** Sprint
+- **Left mouse button (hold):** Break a block
 - **Right mouse button:** Place a block
 - **1 – 5:** Select hotbar slot
 - **F1:** Toggle debug information
@@ -66,7 +68,9 @@ Grass and wood use these options with generated placeholder art
 
 New worlds are generated from a seed: rolling hills of grass over dirt and
 stone, with scattered trees. The blocks are grass, dirt, stone, wood, and
-leaves, and the hotbar has one slot for each.
+leaves, and the hotbar has one slot for each. Breaking takes time: hold the
+left button and watch the bar under the crosshair — soft blocks like leaves
+break quickly while wood and stone take longer.
 
 The world is 256×256×256 blocks stored as sparse 16×16×16 chunks. Only chunks
 that contain blocks are allocated, and breaking or placing a block remeshes just

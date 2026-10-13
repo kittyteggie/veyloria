@@ -7,8 +7,8 @@
 // SUMMARY: Implements player movement physics and block raycasting.
 
 Vector3 PlayerEye(const Player *player) {
-  return (Vector3){player->feet.x, player->feet.y + PLAYER_EYE_HEIGHT,
-                   player->feet.z};
+  float height = player->sneaking ? PLAYER_SNEAK_EYE_HEIGHT : PLAYER_EYE_HEIGHT;
+  return (Vector3){player->feet.x, player->feet.y + height, player->feet.z};
 }
 
 Vector3 LookDirection(const Player *player) {
@@ -31,6 +31,23 @@ bool PlayerCollides(const World *world, Vector3 feet) {
         if (blockDefs[WorldGetBlock(world, x, y, z)].solid)
           return true;
       }
+    }
+  }
+  return false;
+}
+
+// True when at least one block sits directly beneath the player's footprint.
+bool PlayerHasSupport(const World *world, Vector3 feet) {
+  int minX = (int)floorf(feet.x - PLAYER_RADIUS);
+  int maxX = (int)floorf(feet.x + PLAYER_RADIUS);
+  int minZ = (int)floorf(feet.z - PLAYER_RADIUS);
+  int maxZ = (int)floorf(feet.z + PLAYER_RADIUS);
+  int y = (int)floorf(feet.y - 0.001f);
+
+  for (int x = minX; x <= maxX; x++) {
+    for (int z = minZ; z <= maxZ; z++) {
+      if (blockDefs[WorldGetBlock(world, x, y, z)].solid)
+        return true;
     }
   }
   return false;
@@ -72,6 +89,10 @@ static void MovePlayerAxis(Player *player, const World *world, float amount,
   }
 
   if (!PlayerCollides(world, next)) {
+    // Sneaking keeps you on ledges: refuse moves with nothing underneath.
+    if (axis != 1 && player->sneaking && player->grounded &&
+        !PlayerHasSupport(world, next))
+      return;
     player->feet = next;
   } else if (axis == 1 && amount < 0.0f) {
     player->grounded = true;
@@ -102,7 +123,12 @@ void UpdatePlayer(Player *player, const World *world, float deltaTime,
     sideInput /= inputLength;
   }
 
-  float speed = IsKeyDown(KEY_LEFT_SHIFT) ? 7.0f : 4.5f;
+  float speed = PLAYER_WALK_SPEED;
+  player->sneaking = IsKeyDown(KEY_LEFT_SHIFT);
+  if (player->sneaking)
+    speed = PLAYER_SNEAK_SPEED;
+  else if (IsKeyDown(KEY_LEFT_CONTROL))
+    speed = PLAYER_SPRINT_SPEED;
   Vector3 forward = {sinf(player->yaw), 0.0f, -cosf(player->yaw)};
   Vector3 right = {cosf(player->yaw), 0.0f, sinf(player->yaw)};
   float moveX =

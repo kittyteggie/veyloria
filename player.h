@@ -11,6 +11,10 @@
 #define PLAYER_RADIUS 0.30f
 #define PLAYER_HEIGHT 1.80f
 #define PLAYER_EYE_HEIGHT 1.62f
+#define PLAYER_SNEAK_EYE_HEIGHT 1.27f
+#define PLAYER_WALK_SPEED 4.5f
+#define PLAYER_SPRINT_SPEED 7.0f
+#define PLAYER_SNEAK_SPEED 1.8f
 #define MAX_PITCH 1.5f
 #define REACH_DISTANCE 6.0f
 
@@ -20,6 +24,7 @@ typedef struct Player {
   float pitch;
   float verticalVelocity;
   bool grounded;
+  bool sneaking;
 } Player;
 
 typedef struct RayHit {
@@ -36,6 +41,7 @@ typedef struct RayHit {
 Vector3 PlayerEye(const Player *player);
 Vector3 LookDirection(const Player *player);
 bool PlayerCollides(const World *world, Vector3 feet);
+bool PlayerHasSupport(const World *world, Vector3 feet);
 void UpdatePlayer(Player *player, const World *world, float deltaTime,
                   bool applyMouseLook, float mouseSensitivity);
 RayHit CastBlockRay(const World *world, Vector3 origin, Vector3 direction);

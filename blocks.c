@@ -8,36 +8,42 @@ const BlockDef blockDefs[BLOCK_COUNT] = {
     [BLOCK_AIR] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":air",
         .solid = false,
+        .hardness = 0.0f,
         .color = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
         .texture = {NULL, NULL, NULL}
     },
     [BLOCK_GRASS] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":grass",
         .solid = true,
+        .hardness = 0.6f,
         .color = {{98, 160, 68}, {134, 96, 67}, {134, 96, 67}},
         .texture = {"grass_top", "grass_side", "dirt"}
     },
     [BLOCK_DIRT] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":dirt",
         .solid = true,
+        .hardness = 0.5f,
         .color = {{134, 96, 67}, {134, 96, 67}, {134, 96, 67}},
         .texture = {NULL, NULL, NULL}
     },
     [BLOCK_STONE] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":stone",
         .solid = true,
+        .hardness = 1.5f,
         .color = {{132, 136, 143}, {132, 136, 143}, {132, 136, 143}},
         .texture = {NULL, NULL, NULL}
     },
     [BLOCK_WOOD] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":wood",
         .solid = true,
+        .hardness = 2.0f,
         .color = {{122, 94, 58}, {104, 78, 46}, {122, 94, 58}},
         .texture = {"wood_top", "wood_side", "wood_top"}
     },
     [BLOCK_LEAVES] = {
         .name = VEYLORIA_BLOCK_NAMESPACE ":leaves",
         .solid = true,
+        .hardness = 0.2f,
         .color = {{72, 138, 50}, {60, 122, 42}, {60, 122, 42}},
         .texture = {NULL, NULL, NULL}
     }

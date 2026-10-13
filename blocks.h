@@ -41,6 +41,7 @@ typedef struct BlockColor {
 typedef struct BlockDef {
     const char *name;
     bool solid;
+    float hardness;
     BlockColor color[BLOCK_FACE_COUNT];
     // NULL means "use the block's base texture" (assets/<name>.png).
     const char *texture[BLOCK_FACE_COUNT];

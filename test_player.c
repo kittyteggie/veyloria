@@ -111,6 +111,22 @@ static void TestPlayerCollides(void) {
   WorldFree(&world);
 }
 
+static void TestPlayerSupport(void) {
+  World world;
+  WorldInit(&world);
+  WorldSetBlock(&world, 5, 0, 5, BLOCK_STONE);
+
+  // Centred on the supporting block.
+  CHECK(PlayerHasSupport(&world, (Vector3){5.5f, 1.0f, 5.5f}));
+  // Hanging over the edge but still above the block.
+  CHECK(PlayerHasSupport(&world, (Vector3){5.9f, 1.0f, 5.5f}));
+  // Just past the edge: nothing left under the footprint.
+  CHECK(!PlayerHasSupport(&world, (Vector3){6.4f, 1.0f, 5.5f}));
+  // High above empty ground.
+  CHECK(!PlayerHasSupport(&world, (Vector3){10.5f, 5.0f, 5.5f}));
+  WorldFree(&world);
+}
+
 static void TestPlacementOverlap(void) {
   Player player = {0};
   player.feet = (Vector3){5.5f, 2.0f, 5.5f};
@@ -128,6 +144,7 @@ int main(void) {
   TestRayMissesSky();
   TestRayRespectsReach();
   TestPlayerCollides();
+  TestPlayerSupport();
   TestPlacementOverlap();
 
   printf("%d checks, %d failed\n", checksRun, checksFailed);

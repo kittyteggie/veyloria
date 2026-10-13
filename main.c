@@ -16,6 +16,7 @@
 #include <string.h>
 #include <time.h>
 
+#define MINING_TIME_SCALE 1.5f
 #define SAVE_FILE "veyloria-world.sav"
 #define SAVE_TEMP_FILE "veyloria-world.sav.tmp"
 #define SAVE_BACKUP_FILE "veyloria-world.sav.bak"
@@ -154,6 +155,9 @@ int main(void) {
   bool mouseCaptured = false;
   bool exitRequested = false;
   float stepTimer = 0.0f;
+  RayHit miningTarget = {0};
+  float miningProgress = 0.0f;
+  bool miningActive = false;
   ScreenState screen = SCREEN_MAIN_MENU;
 
   bool loadedGame = false;
@@ -236,6 +240,12 @@ int main(void) {
           if (IsKeyPressed(KEY_ONE + slot))
             selectedSlot = slot;
         }
+
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+          int direction = (wheel > 0.0f) ? -1 : 1;
+          selectedSlot = (selectedSlot + direction + HOTBAR_SIZE) % HOTBAR_SIZE;
+        }
         if (IsKeyPressed(KEY_F1))
           debugMode = !debugMode;
         if (IsKeyPressed(KEY_F5)) {
@@ -276,14 +286,39 @@ int main(void) {
         Vector3 eye = PlayerEye(&player);
         RayHit target = CastBlockRay(&world, eye, LookDirection(&player));
         bool changedWorld = false;
+
+        // Hold the left button to mine; progress resets when the target changes.
         if (!justEnteredPlay && target.hit &&
-            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-          ItemStackGive(hotbar, HOTBAR_SIZE, GetBlock(target.x, target.y, target.z));
-          SetBlock(target.x, target.y, target.z, BLOCK_AIR);
-          changedWorld = true;
-          AudioPlayBreak(&audio);
-        } else if (!justEnteredPlay && target.hit &&
-                   IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+          if (!miningActive || miningTarget.x != target.x ||
+              miningTarget.y != target.y || miningTarget.z != target.z) {
+            miningTarget = target;
+            miningProgress = 0.0f;
+            miningActive = true;
+          }
+
+          BlockId minedBlock = GetBlock(target.x, target.y, target.z);
+          float breakTime = blockDefs[minedBlock].hardness * MINING_TIME_SCALE;
+          if (breakTime <= 0.0f)
+            miningProgress = 1.0f;
+          else
+            miningProgress += deltaTime / breakTime;
+
+          if (miningProgress >= 1.0f) {
+            ItemStackGive(hotbar, HOTBAR_SIZE, minedBlock);
+            SetBlock(target.x, target.y, target.z, BLOCK_AIR);
+            AudioPlayBreak(&audio);
+            changedWorld = true;
+            miningProgress = 0.0f;
+            miningActive = false;
+          }
+        } else {
+          miningActive = false;
+          miningProgress = 0.0f;
+        }
+
+        if (!justEnteredPlay && target.hit &&
+            IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
           ItemStack *stack = &hotbar[selectedSlot];
           if (stack->id != BLOCK_AIR && stack->count > 0 &&
               InWorld(target.placeX, target.placeY, target.placeZ) &&
@@ -340,10 +375,7 @@ int main(void) {
       }
       EndMode3D();
 
-      int centerX = GetScreenWidth() / 2;
-      int centerY = GetScreenHeight() / 2;
-      DrawLine(centerX - 7, centerY, centerX + 7, centerY, RAYWHITE);
-      DrawLine(centerX, centerY - 7, centerX, centerY + 7, RAYWHITE);
+      UiDrawCrosshair(miningProgress);
       UiDrawHotbar(selectedSlot, hotbar);
       if (debugMode)
         UiDrawDebug(&world, &player, hotbar, selectedSlot, target,

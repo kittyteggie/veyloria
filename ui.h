@@ -15,6 +15,7 @@ void UiDrawMainMenu(Texture2D background, bool hasBackground, Texture2D logo,
                     bool hasLogo);
 void UiDrawConfigMenu(Texture2D background, bool hasBackground, Texture2D logo,
                       bool hasLogo, const GameSettings *settings);
+void UiDrawCrosshair(float miningProgress);
 void UiDrawHotbar(int selectedSlot, const ItemStack slots[]);
 void UiDrawDebug(const World *world, const Player *player,
                  const ItemStack slots[], int selectedSlot, RayHit hit,
